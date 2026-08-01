@@ -2374,10 +2374,11 @@ value = false
         let sw = load_dbp(&patches_dir().join("debloat-setupwizard.dbp"))
             .expect("debloat-setupwizard.dbp");
         assert_eq!(sw.name, "debloat-setupwizard");
-        assert_eq!(sw.ops.len(), 7);
+        assert_eq!(sw.ops.len(), 8);
         let mut cloud_offline = false;
         let mut cloud_completed = false;
-        let mut fixed_complete = false;
+        let mut fixed_complete_on_create = false;
+        let mut fixed_complete_on_enter_end = false;
         let mut forced_network_avail = false;
         let mut forced_non_commercial = false;
         let mut redirected_easysync = false;
@@ -2417,22 +2418,26 @@ value = false
                     scan_method,
                     target_class,
                     target_method,
+                    proto,
                     value,
                     ..
-                } if scan_class.contains("CompleteLandActivity") => {
+                } if scan_class == "Lcom/zui/setupwizard/CompleteLandActivity;" => {
                     assert_eq!(
                         op.file(),
                         "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk"
                     );
-                    assert_eq!(scan_class, "Lcom/zui/setupwizard/CompleteLandActivity;");
-                    assert_eq!(scan_method.as_deref(), Some("onCreate"));
                     assert_eq!(target_class, "Lcom/zui/setupwizard/common/AppHelper;");
                     assert_eq!(target_method, "isSupportCCS");
+                    assert_eq!(proto, "()Z");
                     assert!(
                         *value,
                         "complete-screen gate must force isSupportCCS -> true"
                     );
-                    fixed_complete = true;
+                    match scan_method.as_deref() {
+                        Some("onCreate") => fixed_complete_on_create = true,
+                        Some("onEnterEnd") => fixed_complete_on_enter_end = true,
+                        other => panic!("unexpected complete-screen lifecycle gate {other:?}"),
+                    }
                 }
                 // Wi-Fi activation: force the network gate true so Next / Set up
                 // later always take the Lenovo ID branch when combined with
@@ -2517,12 +2522,13 @@ value = false
         assert!(
             cloud_offline
                 && cloud_completed
-                && fixed_complete
+                && fixed_complete_on_create
+                && fixed_complete_on_enter_end
                 && forced_network_avail
                 && forced_non_commercial
                 && redirected_easysync
                 && skipped_lenovoid_entry,
-            "all seven setup-wizard ops must parse"
+            "all eight setup-wizard ops must parse"
         );
         let gl =
             load_dbp(&patches_dir().join("show-google-lens.dbp")).expect("show-google-lens.dbp");
@@ -3384,11 +3390,38 @@ value = false
                 .collect();
             let ops: Vec<_> = doc.ops.iter().filter(|op| op.file() == file).collect();
             assert!(!ops.is_empty(), "{file} must have bundled ops");
+            if file == "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk" {
+                let complete_methods: BTreeSet<_> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        DbpOp::InvokeConstBool {
+                            scan_class,
+                            scan_method,
+                            target_class,
+                            target_method,
+                            ..
+                        } if scan_class == "Lcom/zui/setupwizard/CompleteLandActivity;"
+                            && target_class == "Lcom/zui/setupwizard/common/AppHelper;"
+                            && target_method == "isSupportCCS" =>
+                        {
+                            scan_method.as_deref()
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    complete_methods,
+                    BTreeSet::from(["onCreate", "onEnterEnd"]),
+                    "both complete-screen lifecycle gates must be patched"
+                );
+            }
             for op in ops {
                 let mut dex_hits = 0usize;
                 let mut redirect_sites = 0usize;
                 let mut field_sites = 0usize;
                 let mut entry_skip_sites = 0usize;
+                let mut complete_invoke_sites = 0usize;
+                let mut complete_invoke_dex_hits = 0usize;
                 for e in &dex_entries {
                     let original = &apk[e.data_start..e.data_start + e.compressed_size];
                     let mut dex = original.to_vec();
@@ -3438,6 +3471,59 @@ value = false
                             *value,
                         )
                         .unwrap();
+                    }
+                    if let DbpOp::InvokeConstBool {
+                        scan_class,
+                        scan_method,
+                        target_class,
+                        target_method,
+                        proto,
+                        value,
+                        ..
+                    } = op
+                        && scan_class == "Lcom/zui/setupwizard/CompleteLandActivity;"
+                        && target_class == "Lcom/zui/setupwizard/common/AppHelper;"
+                        && target_method == "isSupportCCS"
+                    {
+                        let (ret, params) = parse_method_descriptor(proto).unwrap();
+                        let param_refs: Vec<&str> = params.iter().map(String::as_str).collect();
+                        let mut count_dex = original.to_vec();
+                        let before_len = count_dex.len();
+                        let sites = force_invoke_const_bool(
+                            &mut count_dex,
+                            scan_class,
+                            scan_method.as_deref(),
+                            target_class,
+                            target_method,
+                            &ret,
+                            &param_refs,
+                            *value,
+                        )
+                        .unwrap();
+                        complete_invoke_sites += sites;
+                        if sites > 0 {
+                            complete_invoke_dex_hits += 1;
+                        }
+                        assert_eq!(
+                            count_dex.len(),
+                            before_len,
+                            "complete-screen rewrite must preserve dex length"
+                        );
+                        assert_eq!(
+                            force_invoke_const_bool(
+                                &mut count_dex,
+                                scan_class,
+                                scan_method.as_deref(),
+                                target_class,
+                                target_method,
+                                &ret,
+                                &param_refs,
+                                *value,
+                            )
+                            .unwrap(),
+                            0,
+                            "complete-screen rewrite must have zero hits on second application"
+                        );
                     }
                     if let DbpOp::MethodBroadcastFinish {
                         class,
@@ -3491,6 +3577,22 @@ value = false
                 }
                 if matches!(op, DbpOp::FieldConstBool { .. }) {
                     assert_eq!(field_sites, 1, "the Wi-Fi network gate has one field read");
+                }
+                if matches!(
+                    op,
+                    DbpOp::InvokeConstBool { scan_class, target_class, target_method, .. }
+                        if scan_class == "Lcom/zui/setupwizard/CompleteLandActivity;"
+                            && target_class == "Lcom/zui/setupwizard/common/AppHelper;"
+                            && target_method == "isSupportCCS"
+                ) {
+                    assert_eq!(
+                        complete_invoke_sites, 1,
+                        "complete-screen lifecycle op must rewrite exactly one invocation"
+                    );
+                    assert_eq!(
+                        complete_invoke_dex_hits, 1,
+                        "complete-screen lifecycle op must land in exactly one dex"
+                    );
                 }
                 if matches!(op, DbpOp::MethodBroadcastFinish { .. }) {
                     assert_eq!(

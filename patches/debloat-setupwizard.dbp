@@ -1,7 +1,7 @@
 # Skip Lenovo ID and EasySync while keeping the final Home button usable.
 
 name = "debloat-setupwizard"
-description = "Skip the Lenovo ID entry screen and the removed XuiEasySync restore activity; keep the final home button visible without the Vantage widget."
+description = "Skip the Lenovo ID entry screen and the removed XuiEasySync restore activity; keep the final home button visible across creation and transition completion without the Vantage widget."
 
 [[op]]
 kind = "invoke_const_bool"
@@ -68,6 +68,19 @@ partition = "system"
 file = "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk"
 scan_class = "Lcom/zui/setupwizard/CompleteLandActivity;"
 scan_method = "onCreate"
+target_class = "Lcom/zui/setupwizard/common/AppHelper;"
+target_method = "isSupportCCS"
+value = true
+
+# onEnterEnd checks the same gate again after the page transition. Keep it out
+# of the legacy FloatWindowService path, whose hidden button waits for a removed
+# launcher-widget broadcast.
+[[op]]
+kind = "invoke_const_bool"
+partition = "system"
+file = "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk"
+scan_class = "Lcom/zui/setupwizard/CompleteLandActivity;"
+scan_method = "onEnterEnd"
 target_class = "Lcom/zui/setupwizard/common/AppHelper;"
 target_method = "isSupportCCS"
 value = true
