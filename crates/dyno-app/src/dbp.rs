@@ -2913,6 +2913,54 @@ value = false
         assert_eq!(launcher_ops, 1);
     }
 
+    #[test]
+    fn bundled_recents_finish_inner_rejoin_defines_oem_log_tag() {
+        let recents = load_dbp(&patches_dir().join("fix-third-party-recents.dbp")).unwrap();
+        let (symbols, replacements) = recents
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                DbpOp::MethodCodePatch {
+                    method,
+                    symbols,
+                    replacements,
+                    ..
+                } if method == "finishInner" => Some((symbols, replacements)),
+                _ => None,
+            })
+            .expect("finishInner method_code_patch");
+        assert_eq!(replacements.len(), 2);
+
+        // The entry goto at method pc 0x06 must skip the original-flow guard at
+        // pc 0x1b and enter the hook body at pc 0x1d.
+        let entry = parse_code_template(&replacements[0].to).unwrap();
+        assert_eq!(entry.bytes, [0x29, 0x00, 0x17, 0x00]);
+
+        // The cave replacement begins at method pc 0x1b. Every conditional
+        // exit from the hook converges at pc 0x3d, so the shared rejoin tail
+        // must define the OEM Slog tag in v8 before jumping back to pc 0x08.
+        let cave = parse_code_template(&replacements[1].to).unwrap();
+        let rejoin_tail_off = (0x3dusize - 0x1b) * 2;
+        assert_eq!(
+            &cave.bytes[rejoin_tail_off..rejoin_tail_off + 12],
+            [
+                0x55, 0x13, 0x00, 0x00, // iget-boolean v3, v1, mIsGesture
+                0x1a, 0x08, 0x00, 0x00, // const-string v8, gesture_helper_tag
+                0x29, 0x00, 0xc7, 0xff, // goto/16 pc 0x08 (-57 code units)
+            ]
+        );
+        assert!(cave.slots.iter().any(|slot| {
+            slot.name == "gesture_helper_tag"
+                && slot.offset == rejoin_tail_off + 6
+                && slot.width == 2
+        }));
+        assert!(
+            symbols
+                .iter()
+                .any(|symbol| symbol.name() == "gesture_helper_tag")
+        );
+    }
+
     /// Apply the bundled Recents body-shape alternatives to real SystemUI APK
     /// fixtures. Matching `*_DEX_OUT` variables optionally write the patched
     /// `classes2.dex`.
