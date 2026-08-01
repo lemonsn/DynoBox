@@ -12,6 +12,7 @@ description = "Fix SystemUI and ZuiLauncher Recents transitions with a third-par
 [[op]]
 kind = "method_code_patch"
 partition = "system_ext"
+# Same image-root path as enable-circle-to-search.dbp.
 file = "priv-app/ZuiSystemUI/ZuiSystemUI.apk"
 class = "Lcom/android/wm/shell/recents/RecentTasksController$$ExternalSyntheticLambda6;"
 method = "accept"
@@ -70,6 +71,7 @@ to = "6e 10 af f9 00 00 0c 00 71 20 90 10 02 00"
 [[op]]
 kind = "method_code_patch"
 partition = "system_ext"
+# Same image-root path as enable-circle-to-search.dbp.
 file = "priv-app/ZuiSystemUI/ZuiSystemUI.apk"
 class = "Lcom/android/wm/shell/recents/RecentsTransitionHandler$RecentsController;"
 method = "finishInner"
@@ -111,6 +113,7 @@ to = """
 [[op]]
 kind = "method_code_patch"
 partition = "system"
+# Same image-root path as debloat-launcher.dbp.
 file = "system/priv-app/ZuiLauncher/ZuiLauncher.apk"
 class = "Lcom/android/quickstep/RecentsActivity;"
 method = "M"

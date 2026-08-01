@@ -2625,6 +2625,7 @@ where
         let mut plus_patches: Vec<ReportPlusPatchRecord> = Vec::new();
         for (source, doc) in &docs {
             let mut file_records: Vec<ReportPlusFileRecord> = Vec::new();
+            let mut target_files_found = 0usize;
             for partition in crate::dbp::referenced_partitions([doc]) {
                 let img_name = format!("{partition}.img");
                 if !out_dir.join(&img_name).exists() {
@@ -2648,7 +2649,31 @@ where
                 if results.is_empty() {
                     continue;
                 }
+                let mut partition_modified = false;
                 for r in results {
+                    if !r.target_found {
+                        message(
+                            events,
+                            MessageLevel::Warning,
+                            format!(
+                                "--plus {source}: target {partition}:{} not found; skipping {} op(s)",
+                                r.file, r.ops_skipped
+                            ),
+                        );
+                        continue;
+                    }
+                    target_files_found += 1;
+                    if r.ops_applied == 0 {
+                        message(
+                            events,
+                            MessageLevel::Warning,
+                            format!(
+                                "--plus {source}: target {partition}:{} exists, but all {} op(s) missed their exact sites (already patched or incompatible firmware)",
+                                r.file, r.ops_skipped
+                            ),
+                        );
+                        continue;
+                    }
                     message(
                         events,
                         MessageLevel::Info,
@@ -2657,6 +2682,7 @@ where
                             r.file, r.ops_applied, r.ops_skipped
                         ),
                     );
+                    partition_modified = true;
                     file_records.push(ReportPlusFileRecord {
                         partition: partition.clone(),
                         file: r.file,
@@ -2665,15 +2691,22 @@ where
                         patched_entries: r.patched_entries,
                     });
                 }
-                dirty_partitions.insert(partition.clone(), img_path);
+                if partition_modified {
+                    dirty_partitions.insert(partition.clone(), img_path);
+                }
             }
             if file_records.is_empty() {
+                let reason = if target_files_found == 0 {
+                    "matched no target files"
+                } else {
+                    "found its target files, but no operations matched (already patched or incompatible firmware)"
+                };
                 message(
                     events,
                     MessageLevel::Warning,
                     format!(
-                        "--plus {source}: patch `{}` matched no target files; images left untouched",
-                        doc.name
+                        "--plus {source}: patch `{}` {reason}; images left untouched",
+                        doc.name,
                     ),
                 );
             }
@@ -2715,10 +2748,11 @@ where
             }
         }
         if let Some(plus) = report.plus.as_mut() {
-            let touched = plus
-                .patches
-                .iter()
-                .any(|p| p.files.iter().any(|f| f.partition == *partition));
+            let touched = plus.patches.iter().any(|p| {
+                p.files
+                    .iter()
+                    .any(|f| f.partition == *partition && f.ops_applied > 0)
+            });
             if touched {
                 plus.verity
                     .push((partition.clone(), old_hex.clone(), new_hex.clone()));

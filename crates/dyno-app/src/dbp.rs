@@ -753,6 +753,8 @@ pub fn referenced_partitions<'a>(
 pub struct DbpFileResult {
     /// Path of the patched file inside the partition image.
     pub file: String,
+    /// Whether the declared path exists as a regular file in the partition.
+    pub target_found: bool,
     /// Number of ops that landed at least one site.
     pub ops_applied: usize,
     /// Number of ops that found no target (skipped, not an error).
@@ -763,8 +765,9 @@ pub struct DbpFileResult {
 
 /// Apply every op targeting `partition_name` (across `docs`) inside
 /// `image_path`. Ops are grouped by file so each target is opened, patched, and
-/// written back once. Returns one result per patched file, or an empty vec when
-/// nothing landed (partition left untouched).
+/// written back once. Returns one result per declared target so callers can
+/// distinguish a missing image path from a present file whose firmware-pinned
+/// operations did not land.
 pub fn apply_partition_ops(
     image_path: &Path,
     partition_name: &str,
@@ -787,9 +790,14 @@ pub fn apply_partition_ops(
             .flat_map(|d| d.ops.iter())
             .filter(|op| op.partition() == partition_name && op.file() == file)
             .collect();
-        if let Some(result) = apply_ops_to_file(image_path, &file, &ops)? {
-            results.push(result);
-        }
+        let result = apply_ops_to_file(image_path, &file, &ops)?.unwrap_or(DbpFileResult {
+            file,
+            target_found: false,
+            ops_applied: 0,
+            ops_skipped: ops.len(),
+            patched_entries: Vec::new(),
+        });
+        results.push(result);
     }
     Ok(results)
 }
@@ -858,15 +866,19 @@ fn apply_text_ops_to_file(
     }
 
     let ops_applied = op_landed.iter().filter(|&&b| b).count();
-    if ops_applied == 0 {
-        return Ok(None);
+    if ops_applied > 0 {
+        write_via_extents(image_path, &bytes, &extents, block_size)?;
     }
-    write_via_extents(image_path, &bytes, &extents, block_size)?;
     Ok(Some(DbpFileResult {
         file: file.to_string(),
+        target_found: true,
         ops_applied,
         ops_skipped: ops.len() - ops_applied,
-        patched_entries: vec!["raw bytes".to_string()],
+        patched_entries: if ops_applied > 0 {
+            vec!["raw bytes".to_string()]
+        } else {
+            Vec::new()
+        },
     }))
 }
 
@@ -989,12 +1001,12 @@ fn apply_ops_to_apk(
     }
 
     let ops_applied = op_landed.iter().filter(|&&b| b).count();
-    if ops_applied == 0 {
-        return Ok(None);
+    if ops_applied > 0 {
+        write_via_extents(image_path, &apk_bytes, &apk_extents, block_size)?;
     }
-    write_via_extents(image_path, &apk_bytes, &apk_extents, block_size)?;
     Ok(Some(DbpFileResult {
         file: file.to_string(),
+        target_found: true,
         ops_applied,
         ops_skipped: ops.len() - ops_applied,
         patched_entries,
@@ -2563,6 +2575,40 @@ value = false
                 _ => panic!("recents fix op[{index}] must use method_code_patch"),
             }
         }
+    }
+
+    #[test]
+    fn bundled_recents_paths_match_existing_systemui_and_launcher_patches() {
+        let recents = load_dbp(&patches_dir().join("fix-third-party-recents.dbp")).unwrap();
+        let circle = load_dbp(&patches_dir().join("enable-circle-to-search.dbp")).unwrap();
+        let launcher = load_dbp(&patches_dir().join("debloat-launcher.dbp")).unwrap();
+
+        let systemui_path = circle
+            .ops
+            .iter()
+            .find(|op| op.file().ends_with("/ZuiSystemUI.apk"))
+            .map(|op| (op.partition(), op.file()))
+            .expect("Circle to Search ZuiSystemUI target");
+        let launcher_path = launcher
+            .ops
+            .iter()
+            .find(|op| op.file().ends_with("/ZuiLauncher.apk"))
+            .map(|op| (op.partition(), op.file()))
+            .expect("debloat-launcher ZuiLauncher target");
+
+        let mut systemui_ops = 0usize;
+        let mut launcher_ops = 0usize;
+        for op in &recents.ops {
+            if op.file().ends_with("/ZuiSystemUI.apk") {
+                assert_eq!((op.partition(), op.file()), systemui_path);
+                systemui_ops += 1;
+            } else if op.file().ends_with("/ZuiLauncher.apk") {
+                assert_eq!((op.partition(), op.file()), launcher_path);
+                launcher_ops += 1;
+            }
+        }
+        assert_eq!(systemui_ops, 2);
+        assert_eq!(launcher_ops, 1);
     }
 
     /// Apply the bundled Recents fix to the exact ZUXOS 1.5.10.183 SystemUI
