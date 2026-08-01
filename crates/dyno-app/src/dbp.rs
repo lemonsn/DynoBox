@@ -42,11 +42,11 @@ use memchr::memmem;
 use serde::Deserialize;
 
 use crate::dex_patch::{
-    NopAnchor, force_field_const_bool, force_fragment_render_gone, force_invoke_const_bool,
-    force_invoke_const_int, force_method_broadcast_finish, force_method_return_bool,
-    force_method_return_int, force_method_return_void, force_nop_anchored_invoke,
-    force_remoteviews_gone, force_view_gone, parse_method_descriptor,
-    redirect_intent_action_to_broadcast,
+    MethodCodeReplacement, NopAnchor, force_field_const_bool, force_fragment_render_gone,
+    force_invoke_const_bool, force_invoke_const_int, force_method_broadcast_finish,
+    force_method_return_bool, force_method_return_int, force_method_return_void,
+    force_nop_anchored_invoke, force_remoteviews_gone, force_view_gone, parse_method_descriptor,
+    patch_method_code, redirect_intent_action_to_broadcast,
 };
 use crate::ext4_helpers::{lookup_inode_at_path, open_ext4_volume, write_via_extents};
 use crate::fuck_lgsi::{
@@ -72,6 +72,19 @@ fn default_on_create_bundle_proto() -> String {
 
 fn default_on_create_view() -> String {
     "onCreateView".to_string()
+}
+
+fn default_expected_matches() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DbpCodeReplacement {
+    pub from: String,
+    pub to: String,
+    #[serde(default = "default_expected_matches")]
+    pub expected: usize,
 }
 
 /// A parsed `.dbp` document.
@@ -117,6 +130,17 @@ pub enum DbpOp {
         method: String,
         #[serde(default = "default_void_proto")]
         proto: String,
+    },
+    /// Apply an ordered, atomic set of exact same-length instruction-byte
+    /// replacements inside one fully-qualified method body.
+    MethodCodePatch {
+        partition: String,
+        file: String,
+        class: String,
+        method: String,
+        proto: String,
+        #[serde(default, rename = "replacement")]
+        replacements: Vec<DbpCodeReplacement>,
     },
     /// Force a compiled boolean resource inside a STORED `resources.arsc` APK
     /// entry to `value`.
@@ -270,6 +294,7 @@ impl DbpOp {
             DbpOp::MethodConstBool { partition, .. }
             | DbpOp::MethodConstInt { partition, .. }
             | DbpOp::MethodNop { partition, .. }
+            | DbpOp::MethodCodePatch { partition, .. }
             | DbpOp::ResourceBool { partition, .. }
             | DbpOp::ResourceDimen { partition, .. }
             | DbpOp::TextReplace { partition, .. }
@@ -290,6 +315,7 @@ impl DbpOp {
             DbpOp::MethodConstBool { file, .. }
             | DbpOp::MethodConstInt { file, .. }
             | DbpOp::MethodNop { file, .. }
+            | DbpOp::MethodCodePatch { file, .. }
             | DbpOp::ResourceBool { file, .. }
             | DbpOp::ResourceDimen { file, .. }
             | DbpOp::TextReplace { file, .. }
@@ -373,6 +399,68 @@ pub fn load_dbp(path: &Path) -> Result<DbpDocument> {
             }
             DbpOp::MethodNop { proto, .. } => {
                 validate_method_proto(proto, "V", "void (`V`)", &bail)?;
+            }
+            DbpOp::MethodCodePatch {
+                class,
+                method,
+                proto,
+                replacements,
+                ..
+            } => {
+                if !(class.starts_with('L') && class.ends_with(';') && class.len() > 2) {
+                    return Err(bail(format!(
+                        "method_code_patch `class` must be a JVM descriptor like `Lcom/x/Y;`, got `{class}`"
+                    )));
+                }
+                if method.is_empty() {
+                    return Err(bail(
+                        "method_code_patch `method` must not be empty".to_string(),
+                    ));
+                }
+                if parse_method_descriptor(proto).is_none() {
+                    return Err(bail(format!(
+                        "method_code_patch `proto` is not a valid JVM descriptor: `{proto}`"
+                    )));
+                }
+                if replacements.is_empty() {
+                    return Err(bail(
+                        "method_code_patch requires at least one `replacement`".to_string(),
+                    ));
+                }
+                for (index, replacement) in replacements.iter().enumerate() {
+                    let from = parse_hex_bytes(&replacement.from).map_err(|message| {
+                        bail(format!(
+                            "method_code_patch replacement {} `from`: {message}",
+                            index + 1
+                        ))
+                    })?;
+                    let to = parse_hex_bytes(&replacement.to).map_err(|message| {
+                        bail(format!(
+                            "method_code_patch replacement {} `to`: {message}",
+                            index + 1
+                        ))
+                    })?;
+                    if replacement.expected == 0 {
+                        return Err(bail(format!(
+                            "method_code_patch replacement {} `expected` must be non-zero",
+                            index + 1
+                        )));
+                    }
+                    if from.is_empty() || from.len() % 2 != 0 || from.len() != to.len() {
+                        return Err(bail(format!(
+                            "method_code_patch replacement {} must be non-empty, code-unit aligned, and size-preserving ({} != {})",
+                            index + 1,
+                            from.len(),
+                            to.len()
+                        )));
+                    }
+                    if from == to {
+                        return Err(bail(format!(
+                            "method_code_patch replacement {} must change at least one byte",
+                            index + 1
+                        )));
+                    }
+                }
             }
             DbpOp::ResourceBool { resource, .. } => {
                 if !resource_name_is_safe(resource) {
@@ -631,6 +719,20 @@ fn validate_method_proto(
         ))),
         None => Err(bail(format!("invalid method descriptor `{proto}`"))),
     }
+}
+
+fn parse_hex_bytes(value: &str) -> std::result::Result<Vec<u8>, String> {
+    value
+        .split_ascii_whitespace()
+        .map(|token| {
+            if token.len() != 2 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "invalid byte `{token}` (expected two hexadecimal digits)"
+                ));
+            }
+            u8::from_str_radix(token, 16).map_err(|_| format!("invalid hexadecimal byte `{token}`"))
+        })
+        .collect()
 }
 
 /// Every partition name referenced by the ops across `docs`.
@@ -936,6 +1038,36 @@ fn apply_one_op(dex: &mut [u8], op: &DbpOp) -> Result<bool> {
                 .ok_or_else(|| anyhow!("invalid descriptor `{proto}`"))?;
             let param_refs: Vec<&str> = params.iter().map(String::as_str).collect();
             force_method_return_void(dex, class, method, &ret, &param_refs)
+        }
+        DbpOp::MethodCodePatch {
+            class,
+            method,
+            proto,
+            replacements,
+            ..
+        } => {
+            let (ret, params) = parse_method_descriptor(proto)
+                .ok_or_else(|| anyhow!("invalid descriptor `{proto}`"))?;
+            let param_refs: Vec<&str> = params.iter().map(String::as_str).collect();
+            let decoded: Vec<(Vec<u8>, Vec<u8>, usize)> = replacements
+                .iter()
+                .map(|replacement| {
+                    Ok((
+                        parse_hex_bytes(&replacement.from).map_err(anyhow::Error::msg)?,
+                        parse_hex_bytes(&replacement.to).map_err(anyhow::Error::msg)?,
+                        replacement.expected,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let code_replacements: Vec<MethodCodeReplacement<'_>> = decoded
+                .iter()
+                .map(|(from, to, expected)| MethodCodeReplacement {
+                    from,
+                    to,
+                    expected: *expected,
+                })
+                .collect();
+            patch_method_code(dex, class, method, &ret, &param_refs, &code_replacements)
         }
         DbpOp::InvokeConstBool {
             scan_class,
@@ -2406,6 +2538,170 @@ value = false
             }
             _ => panic!("debloat-theme must contain only the FontActivity invoke_const_bool op"),
         }
+
+        let rf = load_dbp(&patches_dir().join("fix-third-party-recents.dbp"))
+            .expect("fix-third-party-recents.dbp");
+        assert_eq!(rf.name, "fix-third-party-recents");
+        assert_eq!(rf.ops.len(), 3);
+        for (index, expected_replacements) in [8usize, 2, 1].into_iter().enumerate() {
+            match &rf.ops[index] {
+                DbpOp::MethodCodePatch {
+                    partition,
+                    file,
+                    replacements,
+                    ..
+                } => {
+                    if index < 2 {
+                        assert_eq!(partition, "system_ext");
+                        assert_eq!(file, "priv-app/ZuiSystemUI/ZuiSystemUI.apk");
+                    } else {
+                        assert_eq!(partition, "system");
+                        assert_eq!(file, "system/priv-app/ZuiLauncher/ZuiLauncher.apk");
+                    }
+                    assert_eq!(replacements.len(), expected_replacements);
+                }
+                _ => panic!("recents fix op[{index}] must use method_code_patch"),
+            }
+        }
+    }
+
+    /// Apply the bundled Recents fix to the exact ZUXOS 1.5.10.183 SystemUI
+    /// APK. Set `DYNOBOX_ZUISYSTEMUI_APK`; optionally set
+    /// `DYNOBOX_ZUISYSTEMUI_DEX_OUT` to write the patched `classes2.dex`.
+    #[test]
+    fn bundled_recents_fix_lands_on_real_apk() {
+        use sha2::{Digest, Sha256};
+
+        let Ok(path) = std::env::var("DYNOBOX_ZUISYSTEMUI_APK") else {
+            return;
+        };
+        let apk = std::fs::read(path).expect("read ZuiSystemUI.apk");
+        assert_eq!(apk.len(), 221_867_547, "unexpected ZuiSystemUI.apk size");
+        let digest = Sha256::digest(&apk)
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        assert_eq!(
+            digest, "BD2C814D9D98BB4FC28055B0A376D04157F0623A5A4E44049596FE089A11BECC",
+            "unexpected ZuiSystemUI.apk digest"
+        );
+
+        let doc = load_dbp(&patches_dir().join("fix-third-party-recents.dbp")).unwrap();
+        let zip = crate::fuck_lgsi::parse_zip_central_directory(&apk).expect("parse APK zip");
+        let mut landed = 0usize;
+        let mut op_hits = vec![0usize; doc.ops.len()];
+        let mut changed_entries = Vec::new();
+        for entry in zip.entries.iter().filter(|entry| {
+            entry.name.ends_with(".dex")
+                && entry.compression_method == 0
+                && !entry.uses_data_descriptor
+                && !entry.is_zip64
+                && entry.data_start + entry.compressed_size <= apk.len()
+        }) {
+            let original = &apk[entry.data_start..entry.data_start + entry.compressed_size];
+            let mut dex = original.to_vec();
+            let mut entry_hits = 0usize;
+            for (op_index, op) in doc.ops.iter().enumerate() {
+                if apply_one_op(&mut dex, op).unwrap() {
+                    landed += 1;
+                    entry_hits += 1;
+                    op_hits[op_index] += 1;
+                }
+            }
+            if entry_hits != 0 {
+                assert_eq!(dex.len(), original.len(), "DEX size changed");
+                assert_ne!(dex, original, "reported landing without a byte change");
+                crate::fuck_lgsi::recompute_dex_header_sums(&mut dex);
+                changed_entries.push(entry.name.clone());
+                if let Ok(out) = std::env::var("DYNOBOX_ZUISYSTEMUI_DEX_OUT") {
+                    std::fs::write(out, &dex).expect("write patched classes2.dex");
+                }
+            }
+        }
+        assert_eq!(
+            landed, 2,
+            "both Recents method patches must land once; per-op hits: {op_hits:?}"
+        );
+        assert_eq!(changed_entries, ["classes2.dex"]);
+    }
+
+    /// Apply the bundled Launcher guard to the pinned ZUI 18.0.10.084 APK.
+    /// Set `DYNOBOX_ZUILAUNCHER_ZUI18_APK`; optionally set
+    /// `DYNOBOX_ZUILAUNCHER_ZUI18_DEX_OUT` to write patched `classes2.dex`.
+    /// If `DYNOBOX_ZUILAUNCHER_ZUXOS15_APK` is set, also prove that the same
+    /// raw operation safely skips the older TB322 launcher build.
+    #[test]
+    fn bundled_recents_launcher_guard_lands_on_zui18_and_skips_zuxos15() {
+        use sha2::{Digest, Sha256};
+
+        fn launcher_op(doc: &DbpDocument) -> &DbpOp {
+            doc.ops
+                .iter()
+                .find(|op| op.file() == "system/priv-app/ZuiLauncher/ZuiLauncher.apk")
+                .expect("ZuiLauncher method_code_patch op")
+        }
+
+        fn land_on_apk(apk: &[u8], op: &DbpOp, out: Option<&str>) -> (usize, Vec<String>) {
+            let zip = crate::fuck_lgsi::parse_zip_central_directory(apk).expect("parse APK zip");
+            let mut landed = 0usize;
+            let mut changed = Vec::new();
+            for entry in zip.entries.iter().filter(|entry| {
+                entry.name.ends_with(".dex")
+                    && entry.compression_method == 0
+                    && !entry.uses_data_descriptor
+                    && !entry.is_zip64
+                    && entry.data_start + entry.compressed_size <= apk.len()
+            }) {
+                let original = &apk[entry.data_start..entry.data_start + entry.compressed_size];
+                let mut dex = original.to_vec();
+                if apply_one_op(&mut dex, op).unwrap() {
+                    landed += 1;
+                    assert_eq!(dex.len(), original.len(), "DEX size changed");
+                    crate::fuck_lgsi::recompute_dex_header_sums(&mut dex);
+                    changed.push(entry.name.clone());
+                    if let Some(path) = out {
+                        std::fs::write(path, dex).expect("write patched launcher classes2.dex");
+                    }
+                }
+            }
+            (landed, changed)
+        }
+
+        let doc = load_dbp(&patches_dir().join("fix-third-party-recents.dbp")).unwrap();
+        let op = launcher_op(&doc);
+
+        if let Ok(path) = std::env::var("DYNOBOX_ZUILAUNCHER_ZUI18_APK") {
+            let apk = std::fs::read(path).expect("read ZUI 18 ZuiLauncher.apk");
+            assert_eq!(apk.len(), 47_744_193, "unexpected ZUI 18 launcher size");
+            let digest = Sha256::digest(&apk)
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            assert_eq!(
+                digest, "4940CFBDBB0BF712B5F6AB91CA4202F98E8FDC450A7E953123723DEF29F3034E",
+                "unexpected ZUI 18 launcher digest"
+            );
+            let output = std::env::var("DYNOBOX_ZUILAUNCHER_ZUI18_DEX_OUT").ok();
+            let (landed, changed) = land_on_apk(&apk, op, output.as_deref());
+            assert_eq!(landed, 1, "ZUI 18 launcher guard must land once");
+            assert_eq!(changed, ["classes2.dex"]);
+        }
+
+        if let Ok(path) = std::env::var("DYNOBOX_ZUILAUNCHER_ZUXOS15_APK") {
+            let apk = std::fs::read(path).expect("read ZUXOS 1.5 ZuiLauncher.apk");
+            assert_eq!(apk.len(), 47_480_434, "unexpected ZUXOS launcher size");
+            let digest = Sha256::digest(&apk)
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            assert_eq!(
+                digest, "09846E491C3978B1A9F8A83F11D60F58CE1100CD0B5B160311A497B1F60A06C1",
+                "unexpected ZUXOS launcher digest"
+            );
+            let (landed, changed) = land_on_apk(&apk, op, None);
+            assert_eq!(landed, 0, "TB323-pinned launcher op should skip ZUXOS 1.5");
+            assert!(changed.is_empty());
+        }
     }
 
     /// Apply the bundled debloat-settings ops to the real ZuiSettings dexes.
@@ -3219,6 +3515,46 @@ to = "longer"
         );
         let err = load_dbp(f.path()).unwrap_err().to_string();
         assert!(err.contains("identical byte length"), "got: {err}");
+    }
+
+    #[test]
+    fn load_rejects_invalid_method_code_patch_replacements() {
+        for (replacement, expected_message) in [
+            (
+                r#"from = "00"
+to = "00 00""#,
+                "size-preserving",
+            ),
+            (
+                r#"from = "xyz"
+to = "00""#,
+                "invalid byte",
+            ),
+            (
+                r#"from = "00 00"
+to = "00 00"
+expected = 0"#,
+                "must be non-zero",
+            ),
+        ] {
+            let body = format!(
+                r#"
+name = "t"
+[[op]]
+kind = "method_code_patch"
+partition = "system_ext"
+file = "priv-app/X/X.apk"
+class = "Lcom/x/Y;"
+method = "m"
+proto = "()V"
+[[op.replacement]]
+{replacement}
+"#
+            );
+            let f = write_temp_dbp(&body);
+            let err = load_dbp(f.path()).unwrap_err().to_string();
+            assert!(err.contains(expected_message), "got: {err}");
+        }
     }
 
     #[test]

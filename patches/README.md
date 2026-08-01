@@ -84,6 +84,47 @@ init/register hook at its source so all call sites become no-ops.
 | `method` | yes      | method name                                    |
 | `proto`  | no       | JVM method descriptor; must return `V`; defaults to `()V` |
 
+### `method_code_patch`
+
+Apply an ordered, atomic set of exact instruction-byte replacements inside one
+method selected by full class, name, and prototype. This is the firmware-specific
+escape hatch for control-flow fixes that cannot be expressed by a constant or
+nop operation without adding DEX ids or code units.
+
+| field         | required | meaning                                              |
+|---------------|----------|------------------------------------------------------|
+| `class`       | yes      | JVM class descriptor                                 |
+| `method`      | yes      | exact method name                                    |
+| `proto`       | yes      | full JVM method descriptor                           |
+| `replacement` | yes      | one or more ordered replacement tables (see below)   |
+
+Each `[[op.replacement]]` has distinct `from` and `to` strings containing
+whitespace-separated hexadecimal bytes and an optional `expected` match count
+(default `1`). Both byte strings must be non-empty, code-unit aligned, contain
+whole Dalvik instructions, and have identical lengths. DynoBox applies the set
+to a clone first and commits only when every ordered replacement matches its
+declared count. It refuses R8-shared code items and rejects a final body whose
+ordinary branch targets do not land on instruction boundaries.
+
+```toml
+[[op]]
+kind = "method_code_patch"
+partition = "system_ext"
+file = "priv-app/SystemUI/SystemUI.apk"
+class = "Lcom/example/Controller;"
+method = "finish"
+proto = "(Z)V"
+
+[[op.replacement]]
+from = "38 00 03 00"
+to = "39 00 03 00"
+expected = 1
+```
+
+This operation deliberately cannot grow a method, create strings/method/field
+references, or repair arbitrary verifier-invalid register typing. Pin patterns
+to one known firmware build and validate the emitted DEX before flashing.
+
 ### `resource_bool`
 
 Force a compiled boolean resource inside a STORED `resources.arsc` APK entry to
@@ -309,6 +350,29 @@ while still advancing the setup wizard.
 
 ## Bundled patches
 
+* **`fix-third-party-recents.dbp`** — direct, multi-build port of
+  ZuiRecentsFix's SystemUI and Launcher hooks:
+  * On ZUXOS 1.5.10.183, patch
+    `system_ext/priv-app/ZuiSystemUI/ZuiSystemUI.apk`: mirror the null/empty
+    freeform guard in `RecentTasksController$$ExternalSyntheticLambda6.accept`
+    and the requested-finish correction in
+    `RecentsTransitionHandler$RecentsController.finishInner`. Both edits reuse
+    removed debug-log instruction space. The Xposed-only PackageManager check
+    does not fit, so the second edit keys on the full internal fault signature
+    (`requested`, `toHome`, `!mWillFinishToHome`, normal state, non-empty pausing
+    tasks).
+  * On TB323FU ZUI 18.0.10.084, patch
+    `system/priv-app/ZuiLauncher/ZuiLauncher.apk`:
+    `RecentsActivity.M()` queries the existing `ActivityManagerWrapper`, keeps
+    Home navigation for a missing task, a HOME task, or a top component in
+    `com.zui.launcher`, and suppresses the stale callback for any other
+    foreground app. The allowed path uses `startHomeIntentSafely` with a null
+    Bundle; Home still works, but the fallback RecentsActivity path no longer
+    constructs the OEM remote animation. The raw ZUI 18 body pattern safely
+    skips the tested TB322 ZUXOS 1.5 launcher.
+
+  Every landing is inside a STORED `classes2.dex` and preserves its exact byte
+  length.
 * **`debloat-launcher.dbp`** — force ZuiLauncher to ROW behaviour (home slide-up
   global search → ROW branch; no first-run recommended widgets/apps). Forces
   `Utilities.isZuiRow()` + `GraphicsUtils.isZuiRow()` → `true` and

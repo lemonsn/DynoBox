@@ -23,6 +23,10 @@
 //!   `sendBroadcast`, without editing the sorted dex string-data table.
 //! * [`force_method_broadcast_finish`] — rewrite an Activity method body to
 //!   call `super`, `finish()`, broadcast an existing action string, and return.
+//! * [`patch_method_code`] — atomically apply ordered, exact same-length byte
+//!   replacements inside one fully-qualified method body. This is the escape
+//!   hatch for firmware-specific control-flow fixes that cannot be expressed
+//!   by the higher-level primitives without adding dex ids or code units.
 //! * [`force_nop_anchored_invoke`] — nop the first
 //!   `target_class.target_method(...)` invoke (whose result is discarded)
 //!   that follows a specific constant load inside one scan method. Drops a
@@ -353,6 +357,243 @@ fn code_off_is_shared(dex: &[u8], h: &DexHeader, code_off: usize) -> Result<bool
         }
     }
     Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// primitive 0: exact, atomic replacements inside one method body
+// ---------------------------------------------------------------------------
+
+/// One ordered replacement used by [`patch_method_code`].
+///
+/// `from` and `to` are raw Dalvik instruction bytes in little-endian dex
+/// order. They must be non-empty, even-sized, equally long, and each decode to
+/// whole instructions. `expected` pins how many aligned occurrences must be
+/// present after all earlier replacements in the same operation have run.
+#[derive(Debug, Clone, Copy)]
+pub struct MethodCodeReplacement<'a> {
+    pub from: &'a [u8],
+    pub to: &'a [u8],
+    pub expected: usize,
+}
+
+/// Atomically apply ordered exact-byte replacements inside one method body.
+///
+/// The method is selected by class, name, and full prototype. Every
+/// replacement must match its declared count at instruction boundaries; the
+/// operation is abandoned without mutating `dex` if any one does not. The
+/// final body is decoded again and every ordinary branch target is required to
+/// land on an instruction boundary. Code-item size and structural fields are
+/// never changed, and R8-shared code items are refused.
+pub fn patch_method_code(
+    dex: &mut [u8],
+    class_descriptor: &str,
+    method_name: &str,
+    ret_descriptor: &str,
+    params: &[&str],
+    replacements: &[MethodCodeReplacement<'_>],
+) -> Result<bool> {
+    if replacements.is_empty() {
+        return Ok(false);
+    }
+
+    let h = read_dex_header(dex);
+    let Some(code_off) = find_method_code_off(
+        dex,
+        &h,
+        class_descriptor,
+        method_name,
+        ret_descriptor,
+        params,
+    )?
+    else {
+        return Ok(false);
+    };
+    if code_off_is_shared(dex, &h, code_off)? || code_off + 16 > dex.len() {
+        return Ok(false);
+    }
+
+    let insns_size = read_u32_le(dex, code_off + 12) as usize;
+    let insns_bytes = insns_size
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("method instruction size overflow"))?;
+    let insns_start = code_off + 16;
+    let insns_end = insns_start
+        .checked_add(insns_bytes)
+        .filter(|&end| end <= dex.len())
+        .ok_or_else(|| anyhow!("method instruction range exceeds dex"))?;
+
+    let mut working = dex[insns_start..insns_end].to_vec();
+    for replacement in replacements {
+        validate_method_code_replacement(replacement)?;
+        if replacement.from.len() > working.len() {
+            return Ok(false);
+        }
+        let boundaries = instruction_boundaries(&working)?;
+        let matches: Vec<usize> = (0..=working.len() - replacement.from.len())
+            .step_by(2)
+            .filter(|&off| {
+                boundaries.contains(&off)
+                    && boundaries.contains(&(off + replacement.from.len()))
+                    && working[off..off + replacement.from.len()] == *replacement.from
+            })
+            .collect();
+        if matches.len() != replacement.expected {
+            return Ok(false);
+        }
+        if matches
+            .windows(2)
+            .any(|pair| pair[0] + replacement.from.len() > pair[1])
+        {
+            return Err(anyhow!("method-code replacement has overlapping matches"));
+        }
+        for off in matches {
+            working[off..off + replacement.to.len()].copy_from_slice(replacement.to);
+        }
+    }
+
+    validate_method_control_flow(&working)?;
+    dex[insns_start..insns_end].copy_from_slice(&working);
+    Ok(true)
+}
+
+fn validate_method_code_replacement(replacement: &MethodCodeReplacement<'_>) -> Result<()> {
+    if replacement.expected == 0 {
+        return Err(anyhow!(
+            "method-code replacement expected count must be non-zero"
+        ));
+    }
+    if replacement.from.is_empty()
+        || replacement.from.len() % 2 != 0
+        || replacement.from.len() != replacement.to.len()
+    {
+        return Err(anyhow!(
+            "method-code replacement must be non-empty, code-unit aligned, and size-preserving"
+        ));
+    }
+    if replacement.from == replacement.to {
+        return Err(anyhow!(
+            "method-code replacement must change at least one byte"
+        ));
+    }
+    let from_boundaries = instruction_boundaries(replacement.from)?;
+    let to_boundaries = instruction_boundaries(replacement.to)?;
+    if !from_boundaries.contains(&replacement.from.len())
+        || !to_boundaries.contains(&replacement.to.len())
+    {
+        return Err(anyhow!(
+            "method-code replacement must contain only whole Dalvik instructions"
+        ));
+    }
+    Ok(())
+}
+
+fn instruction_boundaries(insns: &[u8]) -> Result<BTreeSet<usize>> {
+    if insns.len() % 2 != 0 {
+        return Err(anyhow!(
+            "Dalvik instruction bytes are not code-unit aligned"
+        ));
+    }
+    let mut boundaries = BTreeSet::new();
+    let mut pc = 0usize;
+    boundaries.insert(0);
+    while pc < insns.len() {
+        let width = instruction_width_bytes(insns, pc)
+            .ok_or_else(|| anyhow!("invalid Dalvik instruction at byte offset {pc}"))?;
+        pc = pc
+            .checked_add(width)
+            .filter(|&next| next <= insns.len())
+            .ok_or_else(|| anyhow!("truncated Dalvik instruction at byte offset {pc}"))?;
+        boundaries.insert(pc);
+    }
+    Ok(boundaries)
+}
+
+fn instruction_width_bytes(insns: &[u8], pc: usize) -> Option<usize> {
+    let unit = read_code_unit(insns, pc)?;
+    let units = match unit {
+        // packed-switch-payload: ident + size + first_key + size targets.
+        0x0100 => {
+            let size = usize::from(read_code_unit(insns, pc + 2)?);
+            4usize.checked_add(size.checked_mul(2)?)?
+        }
+        // sparse-switch-payload: ident + size + size keys + size targets.
+        0x0200 => {
+            let size = usize::from(read_code_unit(insns, pc + 2)?);
+            2usize.checked_add(size.checked_mul(4)?)?
+        }
+        // fill-array-data-payload: 4-unit header + packed element bytes.
+        0x0300 => {
+            let element_width = usize::from(read_code_unit(insns, pc + 2)?);
+            let size = usize::try_from(read_code_u32(insns, pc + 4)?).ok()?;
+            let data_bytes = element_width.checked_mul(size)?;
+            4usize.checked_add(data_bytes.checked_add(1)? / 2)?
+        }
+        _ => usize::from(dex_walker::insn_width_units(insns[pc])),
+    };
+    units.checked_mul(2).filter(|&width| width != 0)
+}
+
+fn read_code_unit(bytes: &[u8], off: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([*bytes.get(off)?, *bytes.get(off + 1)?]))
+}
+
+fn read_code_u32(bytes: &[u8], off: usize) -> Option<u32> {
+    Some(u32::from_le_bytes([
+        *bytes.get(off)?,
+        *bytes.get(off + 1)?,
+        *bytes.get(off + 2)?,
+        *bytes.get(off + 3)?,
+    ]))
+}
+
+fn validate_method_control_flow(insns: &[u8]) -> Result<()> {
+    let boundaries = instruction_boundaries(insns)?;
+    for &pc in boundaries.iter().filter(|&&pc| pc < insns.len()) {
+        let opcode = insns[pc];
+        let delta_units = match opcode {
+            0x28 => Some(i8::from_le_bytes([insns[pc + 1]]) as isize),
+            0x29 | 0x32..=0x3d => Some(i16::from_le_bytes([
+                *insns
+                    .get(pc + 2)
+                    .ok_or_else(|| anyhow!("truncated branch at byte offset {pc}"))?,
+                *insns
+                    .get(pc + 3)
+                    .ok_or_else(|| anyhow!("truncated branch at byte offset {pc}"))?,
+            ]) as isize),
+            0x26 | 0x2a..=0x2c => Some(i32::from_le_bytes([
+                *insns
+                    .get(pc + 2)
+                    .ok_or_else(|| anyhow!("truncated branch at byte offset {pc}"))?,
+                *insns
+                    .get(pc + 3)
+                    .ok_or_else(|| anyhow!("truncated branch at byte offset {pc}"))?,
+                *insns
+                    .get(pc + 4)
+                    .ok_or_else(|| anyhow!("truncated branch at byte offset {pc}"))?,
+                *insns
+                    .get(pc + 5)
+                    .ok_or_else(|| anyhow!("truncated branch at byte offset {pc}"))?,
+            ]) as isize),
+            _ => None,
+        };
+        let Some(delta_units) = delta_units else {
+            continue;
+        };
+        let target_units = isize::try_from(pc / 2)
+            .ok()
+            .and_then(|base| base.checked_add(delta_units))
+            .ok_or_else(|| anyhow!("branch target overflow at byte offset {pc}"))?;
+        let target = usize::try_from(target_units)
+            .ok()
+            .and_then(|units| units.checked_mul(2))
+            .ok_or_else(|| anyhow!("branch target before method at byte offset {pc}"))?;
+        if !boundaries.contains(&target) {
+            return Err(anyhow!(
+                "branch at byte offset {pc} targets non-instruction boundary {target}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2076,6 +2317,45 @@ mod tests {
         assert_eq!(parse_method_descriptor("Z"), None);
         assert_eq!(parse_method_descriptor("()"), None);
         assert_eq!(parse_method_descriptor("(L)Z"), None);
+    }
+
+    #[test]
+    fn method_code_replacement_requires_whole_equal_size_instructions() {
+        let valid = MethodCodeReplacement {
+            from: &[0x12, 0x00, 0x0e, 0x00],
+            to: &[0x12, 0x01, 0x0e, 0x00],
+            expected: 1,
+        };
+        assert!(validate_method_code_replacement(&valid).is_ok());
+
+        let truncated = MethodCodeReplacement {
+            from: &[0x29, 0x00],
+            to: &[0x00, 0x00],
+            expected: 1,
+        };
+        assert!(validate_method_code_replacement(&truncated).is_err());
+
+        let resized = MethodCodeReplacement {
+            from: &[0x00, 0x00],
+            to: &[0x00, 0x00, 0x00, 0x00],
+            expected: 1,
+        };
+        assert!(validate_method_code_replacement(&resized).is_err());
+
+        let unchanged = MethodCodeReplacement {
+            from: &[0x00, 0x00],
+            to: &[0x00, 0x00],
+            expected: 1,
+        };
+        assert!(validate_method_code_replacement(&unchanged).is_err());
+    }
+
+    #[test]
+    fn method_code_control_flow_rejects_mid_instruction_branch() {
+        // goto/16 +2 code units lands on the return-void instruction.
+        assert!(validate_method_control_flow(&[0x29, 0x00, 0x02, 0x00, 0x0e, 0x00]).is_ok());
+        // +1 code unit lands in goto/16's own signed-offset operand.
+        assert!(validate_method_control_flow(&[0x29, 0x00, 0x01, 0x00, 0x0e, 0x00]).is_err());
     }
 
     #[test]

@@ -1,0 +1,136 @@
+name = "fix-third-party-recents"
+description = "Fix SystemUI and ZuiLauncher Recents transitions with a third-party default launcher."
+
+# Mirror ZuiRecentsFix's GoingToOverview guard inside the OEM synthetic
+# Consumer. The first ordered replacement turns a removed debug-log block into
+# an animator-cancel code cave. Subsequent replacements route the
+# GoingToOverview branch through an ArrayList.isEmpty() guard: an empty list
+# records prevVisibleFreeforms + mLauncherState and returns, while a non-empty
+# list rejoins the byte-identical OEM hideAllTasks path. The final three
+# replacements give each surviving debug call a path-correct String tag after
+# the original tag-initializing prologue becomes the code cave.
+[[op]]
+kind = "method_code_patch"
+partition = "system_ext"
+file = "priv-app/ZuiSystemUI/ZuiSystemUI.apk"
+class = "Lcom/android/wm/shell/recents/RecentTasksController$$ExternalSyntheticLambda6;"
+method = "accept"
+proto = "(Ljava/lang/Object;)V"
+
+[[op.replacement]]
+from = """
+22 00 87 4f 1a 01 5d 80 70 20 a2 f9 10 00 6e 20 ab f9 50 00
+6e 10 af f9 00 00 0c 00 1a 01 5c 80 71 20 90 10 01 00
+"""
+to = """
+29 00 13 00 54 64 9f c9 54 44 bc c9 54 44 95 c9 55 41 88 c9
+38 01 07 00 54 44 87 c9 6e 10 63 00 04 00 29 00 02 01
+"""
+
+[[op.replacement]]
+from = "1a 00 d6 24 6e 20 52 f9 50 00 0a 00 38 00 20 00"
+to = "1a 00 d6 24 6e 20 52 f9 50 00 0a 01 38 01 20 00"
+
+[[op.replacement]]
+from = "0c 00 5b 60 a8 c9"
+to = "0c 04 29 00 ed ff"
+
+[[op.replacement]]
+from = """
+54 65 9f c9 54 55 bc c9 54 55 95 c9 55 50 88 c9 38 00 07 00
+54 55 87 c9 6e 10 63 00 05 00
+"""
+to = """
+29 00 fe fe 5b 64 a8 c9 38 04 08 00 6e 10 4d fa 04 00 0a 01
+38 01 0d 00 5b 60 a1 c9 0e 00
+"""
+
+[[op.replacement]]
+from = "6e 51 92 e4 05 23"
+to = "6e 51 92 e4 45 23"
+
+[[op.replacement]]
+from = "1a 00 67 80 71 20 90 10 01 00"
+to = "1a 00 67 80 71 20 90 10 05 00"
+
+[[op.replacement]]
+from = "1a 00 68 80 71 20 90 10 01 00"
+to = "1a 00 68 80 71 20 90 10 05 00"
+
+[[op.replacement]]
+from = "6e 10 af f9 00 00 0c 00 71 20 90 10 01 00"
+to = "6e 10 af f9 00 00 0c 00 71 20 90 10 02 00"
+
+# Mirror the finishInner before-hook. The entry jumps into a second code cave
+# made from the removed OVF debug message. Only a "requested" finish whose
+# toHome argument conflicts with the controller's normal, non-empty pausing
+# state is rewritten to false. The Xposed module's PackageManager lookup is
+# intentionally omitted: the internal inconsistency is the actual fault
+# signature and needs no new dex ids or code units.
+[[op]]
+kind = "method_code_patch"
+partition = "system_ext"
+file = "priv-app/ZuiSystemUI/ZuiSystemUI.apk"
+class = "Lcom/android/wm/shell/recents/RecentsTransitionHandler$RecentsController;"
+method = "finishInner"
+proto = "(ZZLcom/android/internal/os/IResultReceiver;Ljava/lang/String;)V"
+
+[[op.replacement]]
+from = "55 13 65 d3"
+to = "29 00 17 00"
+
+[[op.replacement]]
+from = """
+22 07 87 4f 1a 08 b9 7f 70 20 a2 f9 87 00 6e 20 ac f9 07 00
+1a 08 c6 14 6e 20 ab f9 87 00 6e 20 ac f9 67 00 1a 08 54 15
+6e 20 ab f9 87 00 52 38 ed d2 6e 20 a6 f9 87 00 1a 08 1e 12
+6e 20 ab f9 87 00 55 38 ee d2 6e 20 ac f9 87 00 1a 08 19 12
+6e 20 ab f9 87 00 55 38 ec d2 6e 20 ac f9 87 00 6e 10 af f9
+07 00 0c 07 1a 08 4b 80 71 20 11 11 78 00
+"""
+to = """
+29 00 39 00 08 06 1b 00 1b 03 3a 0d 01 00 6e 20 52 f9 63 00
+0a 03 38 03 17 00 38 00 15 00 55 13 78 d3 39 03 11 00 52 13
+75 d3 39 03 0d 00 54 13 6c d3 38 03 09 00 6e 10 4d fa 03 00
+0a 03 39 03 03 00 12 00 55 13 65 d3 29 00 c9 ff
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+"""
+
+# Port the ZuiLauncher hook into RecentsActivity.M()V. RecentsActivity is
+# the fallback overview used when Home and Overview differ. Query the existing
+# ActivityManagerWrapper for the current top task: keep startHome for a missing
+# task, a HOME task, or RecentsActivity itself; otherwise suppress the stale
+# startHome callback that steals focus after launching a third-party app.
+#
+# The allowed path intentionally calls the existing startHomeIntentSafely
+# overload with a null Bundle. The Xposed hook would proceed through the OEM
+# RemoteTransition setup, but that animation wrapper cannot coexist with the
+# guard inside this fixed 52-code-unit body. Functional Home navigation remains;
+# only the OEM remote animation is omitted on this fallback path.
+[[op]]
+kind = "method_code_patch"
+partition = "system"
+file = "system/priv-app/ZuiLauncher/ZuiLauncher.apk"
+class = "Lcom/android/quickstep/RecentsActivity;"
+method = "M"
+proto = "()V"
+
+[[op.replacement]]
+from = """
+22 06 95 05 6e 10 dc 00 08 00 0c 00 54 81 11 1f 12 12
+70 40 f1 17 06 21 22 07 58 02 16 02 fa 00 16 04 00 00
+07 70 07 61 76 06 39 0a 00 00 22 00 1a 03 6e 10 b2 7c
+06 00 0c 01 6e 10 d7 00 08 00 0c 02 1a 03 a3 59 70 40
+9b 10 10 32 71 20 2d 01 07 00 0c 00 6e 10 4a 01 00 00
+0c 00 1a 01 d3 54 71 30 4e 4e 08 01 0e 00
+"""
+to = """
+71 00 28 8d 00 00 0c 00 6e 10 2d 8d 00 00 0c 00
+38 00 19 00 71 10 36 8d 00 00 0a 01 39 01 13 00
+54 01 62 00 38 01 0f 00 6e 10 18 03 01 00 0c 01
+1a 02 9c 72 6e 20 14 f2 12 00 0a 01 39 01 03 00
+0e 00 12 00 1a 01 d3 54 71 30 4e 4e 08 01 0e 00
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00
+"""
