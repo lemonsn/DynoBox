@@ -8,7 +8,7 @@ use tempfile::TempDir;
 
 use crate::avb_descriptor::read_hashtree_params;
 use crate::boot_spl::{
-    BOOT_SPL_PROPERTY, BootSplPatchOutcome, patch_security_patch, validate_spl_format,
+    BOOT_SPL_PROPERTY, BootSplPatchOutcome, resign_image_with_security_patch, validate_spl_format,
 };
 use crate::events::{CommandKind, EventSink, MessageLevel, ProgressEvent, ProgressUnit, StageKind};
 use crate::fuck_lgsi::{
@@ -2770,6 +2770,7 @@ where
 
     let mut boot_spl_applied: Option<(String, String)> = None;
     if let Some(new_spl) = config.boot_spl.as_deref() {
+        validate_spl_format(new_spl)?;
         let boot_image_in_images = images.iter().any(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
@@ -2783,50 +2784,6 @@ where
             ));
         }
         ensure_images_local(&mut local_inode_cache, out_dir, &["boot.img"])?;
-        let boot_out_path = out_dir.join("boot.img");
-        match patch_security_patch(&boot_out_path, new_spl)? {
-            BootSplPatchOutcome::Patched { old, new } => {
-                message(
-                    events,
-                    MessageLevel::Info,
-                    format!(
-                        "boot.img {} bumped from {} to {}",
-                        BOOT_SPL_PROPERTY, old, new
-                    ),
-                );
-                report.boot_spl = Some(ReportSplRecord {
-                    property: BOOT_SPL_PROPERTY.to_string(),
-                    from: Some(old.clone()),
-                    to: new.clone(),
-                    applied: true,
-                    reason: String::new(),
-                });
-                boot_spl_applied = Some((old, new));
-            }
-            BootSplPatchOutcome::SkippedNotNewer { old, requested } => {
-                message(
-                    events,
-                    MessageLevel::Warning,
-                    format!(
-                        "boot.img {} not bumped: requested {} is not newer than current {}; re-signing without SPL change",
-                        BOOT_SPL_PROPERTY, requested, old
-                    ),
-                );
-                report.boot_spl = Some(ReportSplRecord {
-                    property: BOOT_SPL_PROPERTY.to_string(),
-                    from: Some(old.clone()),
-                    to: requested.clone(),
-                    applied: false,
-                    reason: format!("requested {requested} is not newer than current {old}"),
-                });
-            }
-            BootSplPatchOutcome::NotFound => {
-                return Err(anyhow::anyhow!(
-                    "boot.img has no {} property descriptor; cannot apply --boot-spl",
-                    BOOT_SPL_PROPERTY
-                ));
-            }
-        }
     }
 
     // Detect a key change between the OEM signing key already on the
@@ -2862,38 +2819,91 @@ where
         });
 
         let out_path = out_dir.join(&filename);
-        // boot.img may have already been re-inoded by the SPL patch above; that
-        // is a no-op (we copy the already-fresh inode to a new one). All other
-        // images go through this guard so the resign write hits a private inode.
+        // Every resign write must hit a private inode. The boot SPL update now
+        // runs after the dependency verifies and re-signs the original image.
         local_inode_cache.ensure(&out_path)?;
 
-        let result = match effective_rollback {
-            Some(ri) => avbtool_rs::resign::resign_image_with_options(
+        let mut boot_spl_outcome = None;
+        let result: anyhow::Result<_> = if filename == "boot.img"
+            && let Some(new_spl) = config.boot_spl.as_deref()
+        {
+            resign_image_with_security_patch(
                 &out_path,
                 &config.key,
                 config.algorithm.as_deref(),
                 config.force,
-                Some(ri),
+                effective_rollback,
+                new_spl,
+            )
+            .map(|outcome| {
+                boot_spl_outcome = Some(outcome.spl);
+                outcome.resign
+            })
+        } else {
+            avbtool_rs::resign::resign_image_with_options(
+                &out_path,
+                &config.key,
+                config.algorithm.as_deref(),
+                config.force,
+                effective_rollback,
                 false,
-            ),
-            None => avbtool_rs::resign::resign_image(
-                &out_path,
-                &config.key,
-                config.algorithm.as_deref(),
-                config.force,
-            ),
+            )
+            .map_err(anyhow::Error::from)
         };
 
-        match result {
-            Err(e) => {
-                return Err(e).with_context(|| format!("Failed to resign {}", filename));
-            }
-            Ok(avbtool_rs::resign::ResignOutcome::Resigned) => {
+        match result.with_context(|| format!("Failed to resign {}", filename))? {
+            avbtool_rs::resign::ResignOutcome::Resigned => {
                 resigned_count += 1;
                 report.resigned_images.push(filename.clone());
             }
-            Ok(avbtool_rs::resign::ResignOutcome::SkippedUnsigned) => {
+            avbtool_rs::resign::ResignOutcome::SkippedUnsigned => {
                 skipped_unsigned_count += 1;
+            }
+        }
+
+        if let Some(outcome) = boot_spl_outcome {
+            match outcome {
+                BootSplPatchOutcome::Patched { old, new } => {
+                    message(
+                        events,
+                        MessageLevel::Info,
+                        format!(
+                            "boot.img {} bumped from {} to {}",
+                            BOOT_SPL_PROPERTY, old, new
+                        ),
+                    );
+                    report.boot_spl = Some(ReportSplRecord {
+                        property: BOOT_SPL_PROPERTY.to_string(),
+                        from: Some(old.clone()),
+                        to: new.clone(),
+                        applied: true,
+                        reason: String::new(),
+                    });
+                    boot_spl_applied = Some((old, new));
+                }
+                BootSplPatchOutcome::SkippedNotNewer { old, requested } => {
+                    message(
+                        events,
+                        MessageLevel::Warning,
+                        format!(
+                            "boot.img {} not bumped: requested {} is not newer than current {}; re-signed without SPL change",
+                            BOOT_SPL_PROPERTY, requested, old
+                        ),
+                    );
+                    report.boot_spl = Some(ReportSplRecord {
+                        property: BOOT_SPL_PROPERTY.to_string(),
+                        from: Some(old.clone()),
+                        to: requested.clone(),
+                        applied: false,
+                        reason: format!("requested {requested} is not newer than current {old}"),
+                    });
+                }
+                BootSplPatchOutcome::NotFound => {
+                    return Err(anyhow::anyhow!(
+                        "boot.img has no {} property descriptor; cannot apply --boot-spl",
+                        BOOT_SPL_PROPERTY
+                    ));
+                }
             }
         }
 
