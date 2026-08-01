@@ -9,7 +9,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use avbtool_rs::crypto::{
@@ -39,6 +39,56 @@ pub struct BootSplResignOutcome {
     pub resign: ResignOutcome,
     /// Result of the subsequent same-size boot SPL property update.
     pub spl: BootSplPatchOutcome,
+}
+
+/// A VBMeta image that avbtool-rs has verified and re-signed before DynoBox
+/// performs a known, same-size descriptor mutation.
+#[derive(Debug)]
+pub struct PreparedVbmetaResign {
+    image_path: PathBuf,
+    key_spec: String,
+    outcome: ResignOutcome,
+}
+
+impl PreparedVbmetaResign {
+    /// Recompute the authentication block over the descriptor bytes written
+    /// after preparation and return the original resign outcome.
+    pub fn finish(self) -> Result<ResignOutcome> {
+        refresh_vbmeta_authentication(&self.image_path, &self.key_spec)?;
+        Ok(self.outcome)
+    }
+}
+
+/// Verify and re-sign an untouched VBMeta image before a caller applies a
+/// trusted same-size descriptor mutation. The returned marker must be finished
+/// after all mutations to authenticate the final header + auxiliary data.
+pub fn prepare_vbmeta_for_descriptor_mutation(
+    image_path: &Path,
+    key_spec: &str,
+    algorithm_name: Option<&str>,
+    force: bool,
+    rollback_index: Option<u64>,
+) -> Result<PreparedVbmetaResign> {
+    ensure_dense_avb_image(image_path)?;
+    let outcome = resign_image_with_options(
+        image_path,
+        key_spec,
+        algorithm_name,
+        force,
+        rollback_index,
+        false,
+    )
+    .with_context(|| {
+        format!(
+            "failed to verify and re-sign {} before descriptor mutation",
+            image_path.display()
+        )
+    })?;
+    Ok(PreparedVbmetaResign {
+        image_path: image_path.to_path_buf(),
+        key_spec: key_spec.to_string(),
+        outcome,
+    })
 }
 
 /// Validate that `spl` is a strict `YYYY-MM-DD` 10-byte ASCII string. The
@@ -154,7 +204,7 @@ pub fn resign_image_with_security_patch(
     Ok(BootSplResignOutcome { resign, spl })
 }
 
-fn refresh_vbmeta_authentication(image_path: &Path, key_spec: &str) -> Result<()> {
+pub(crate) fn refresh_vbmeta_authentication(image_path: &Path, key_spec: &str) -> Result<()> {
     let vbmeta = avbtool_rs::image::load_vbmeta_blob(image_path)
         .with_context(|| format!("failed to read VBMeta from {}", image_path.display()))?;
     if vbmeta.len() < AVB_VBMETA_IMAGE_HEADER_SIZE {
@@ -188,7 +238,7 @@ fn refresh_vbmeta_authentication(image_path: &Path, key_spec: &str) -> Result<()
     let expected_public_key = extract_public_key(key_spec)?;
     if vbmeta[public_key_start..public_key_end] != expected_public_key {
         return Err(anyhow!(
-            "boot VBMeta public key does not match the requested signing key"
+            "VBMeta public key does not match the requested signing key"
         ));
     }
 
@@ -205,7 +255,7 @@ fn refresh_vbmeta_authentication(image_path: &Path, key_spec: &str) -> Result<()
         || signature.len() != usize::try_from(header.signature_size)?
     {
         return Err(anyhow!(
-            "generated boot VBMeta authentication sizes do not match the header"
+            "generated VBMeta authentication sizes do not match the header"
         ));
     }
 
@@ -233,7 +283,7 @@ fn refresh_vbmeta_authentication(image_path: &Path, key_spec: &str) -> Result<()
         AvbPublicKey::decode(&expected_public_key)?.verify(algorithm, &signature, &data_to_sign)?
     };
     if !signature_valid {
-        return Err(anyhow!("generated boot VBMeta signature did not verify"));
+        return Err(anyhow!("generated VBMeta signature did not verify"));
     }
 
     let mut authentication = vec![0u8; auth_size];
@@ -258,11 +308,11 @@ fn refresh_vbmeta_authentication(image_path: &Path, key_spec: &str) -> Result<()
         || persisted[aux_start..aux_end] != vbmeta[aux_start..aux_end]
     {
         return Err(anyhow!(
-            "boot VBMeta header or auxiliary data changed during authentication refresh"
+            "VBMeta header or auxiliary data changed during authentication refresh"
         ));
     }
     if persisted[AVB_VBMETA_IMAGE_HEADER_SIZE..persisted_auth_end] != authentication {
-        return Err(anyhow!("boot VBMeta authentication write did not persist"));
+        return Err(anyhow!("VBMeta authentication write did not persist"));
     }
     Ok(())
 }
@@ -271,10 +321,12 @@ fn ensure_dense_avb_image(image_path: &Path) -> Result<()> {
     let image =
         avbtool_rs::sparse::ImageHandler::open(image_path, true).map_err(|error| anyhow!(error))?;
     if image.is_sparse() {
-        return Err(anyhow!("cannot patch boot SPL in an Android sparse image"));
+        return Err(anyhow!(
+            "cannot mutate VBMeta descriptors in an Android sparse image"
+        ));
     }
     if detect_avb_image_type(image_path)? == AvbImageType::None {
-        return Err(anyhow!("boot image has no AVB metadata"));
+        return Err(anyhow!("image has no AVB metadata"));
     }
     Ok(())
 }
@@ -380,6 +432,57 @@ mod tests {
                 .header
                 .rollback_index,
             123
+        );
+        verify_image(
+            &image,
+            &VerifyImageOptions {
+                key_blob: Some(
+                    avbtool_rs::crypto::extract_public_key("testkey_rsa2048_2").unwrap(),
+                ),
+                expected_chain_partitions: Vec::new(),
+                follow_chain_partitions: false,
+                accept_zeroed_hashtree: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prepared_vbmeta_resign_allows_descriptor_mutation_after_v02_verification() {
+        use avbtool_rs::resign::ResignOutcome;
+        use avbtool_rs::verify::{VerifyImageOptions, verify_image};
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("vbmeta.img");
+        signed_boot_vbmeta(
+            &image,
+            Some("2025-02-05"),
+            "SHA256_RSA2048",
+            "testkey_rsa2048",
+        );
+
+        let prepared = prepare_vbmeta_for_descriptor_mutation(
+            &image,
+            "testkey_rsa2048_2",
+            None,
+            false,
+            Some(456),
+        )
+        .unwrap();
+        let patch = patch_property_value(&image, BOOT_SPL_PROPERTY, b"2026-02-05").unwrap();
+        assert!(matches!(patch, PatchPropertyOutcome::Patched { .. }));
+
+        assert_eq!(prepared.finish().unwrap(), ResignOutcome::Resigned);
+        assert_eq!(
+            read_security_patch(&image).unwrap().as_deref(),
+            Some("2026-02-05")
+        );
+        assert_eq!(
+            avbtool_rs::image::inspect_avb_image(&image)
+                .unwrap()
+                .header
+                .rollback_index,
+            456
         );
         verify_image(
             &image,

@@ -8,7 +8,8 @@ use tempfile::TempDir;
 
 use crate::avb_descriptor::read_hashtree_params;
 use crate::boot_spl::{
-    BOOT_SPL_PROPERTY, BootSplPatchOutcome, resign_image_with_security_patch, validate_spl_format,
+    BOOT_SPL_PROPERTY, BootSplPatchOutcome, PreparedVbmetaResign,
+    prepare_vbmeta_for_descriptor_mutation, resign_image_with_security_patch, validate_spl_format,
 };
 use crate::events::{CommandKind, EventSink, MessageLevel, ProgressEvent, ProgressUnit, StageKind};
 use crate::fuck_lgsi::{
@@ -1852,22 +1853,34 @@ fn find_owning_vbmeta(out_dir: &Path, partition_name: &str) -> anyhow::Result<Op
 }
 
 /// Regenerate the dm-verity hash tree for one modified partition and propagate
-/// the new root digest wherever the Hashtree descriptor lives — the partition
-/// footer and/or the owning vbmeta — adding both to the resign list. Returns
-/// `(old_hex, new_hex)`, or `None` when the partition carries no Hashtree
-/// descriptor (not verity-protected).
+/// the new root digest to the unsigned partition footer. A signed owning
+/// VBMeta patch is returned to the caller so it can verify/re-sign the original
+/// image before changing descriptor bytes. Returns `None` when the partition
+/// carries no Hashtree descriptor (not verity-protected).
 ///
 /// Called once per dirty partition after all mutating ops (SPL / fuck-lgsi /
 /// debloat) have run, so a partition touched by several ops is walked a single
 /// time instead of once per op.
+#[derive(Debug)]
+struct PendingVbmetaHashtreePatch {
+    image_name: String,
+    partition_name: String,
+    root_digest: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct FinalizedPartitionVerity {
+    old_hex: String,
+    new_hex: String,
+    pending_vbmeta_patch: Option<PendingVbmetaHashtreePatch>,
+}
+
 fn finalize_partition_verity<S>(
     events: &mut S,
     out_dir: &Path,
     partition_name: &str,
     image_path: &Path,
-    local_inode_cache: &mut LocalInodeCache,
-    images: &mut Vec<PathBuf>,
-) -> anyhow::Result<Option<(String, String)>>
+) -> anyhow::Result<Option<FinalizedPartitionVerity>>
 where
     S: EventSink + ?Sized,
 {
@@ -1922,13 +1935,17 @@ where
         // applied to (and post-checked against) an unsigned image.
         crate::avb_descriptor::patch_hashtree_root_digest(image_path, partition_name, &new_digest)?;
     }
-    if let Some(vbmeta) = &owning_vbmeta {
-        if let Some(vbname) = vbmeta.file_name().and_then(|n| n.to_str()) {
-            ensure_images_local(local_inode_cache, out_dir, &[vbname])?;
-            crate::avb_descriptor::patch_hashtree_root_digest(vbmeta, partition_name, &new_digest)?;
-            ensure_image_in_resign_list(images, out_dir, vbname);
-        }
-    }
+    // A signed owning VBMeta cannot be patched until avbtool-rs 0.2 has
+    // verified and re-signed its original bytes. Return the semantic patch to
+    // the caller, which prepares the image before applying it.
+    let pending_vbmeta_patch = owning_vbmeta
+        .as_ref()
+        .and_then(|vbmeta| vbmeta.file_name().and_then(|name| name.to_str()))
+        .map(|image_name| PendingVbmetaHashtreePatch {
+            image_name: image_name.to_string(),
+            partition_name: partition_name.to_string(),
+            root_digest: new_digest.clone(),
+        });
     let new_hex = crate::avb_descriptor::hex_encode(&new_digest);
     message(
         events,
@@ -1939,7 +1956,11 @@ where
             &new_hex[..16.min(new_hex.len())]
         ),
     );
-    Ok(Some((old_hex, new_hex)))
+    Ok(Some(FinalizedPartitionVerity {
+        old_hex,
+        new_hex,
+        pending_vbmeta_patch,
+    }))
 }
 
 /// Copy a non-interactive feature input into its stable output artifact path.
@@ -2228,6 +2249,11 @@ where
     copy_all_top_level_files(input, out_dir)?;
 
     let all_images = collect_resignable_images(input)?;
+    // Capture the OEM/OTA key before a prepared VBMeta is re-signed with the
+    // replacement key. The final warning must describe the real key change.
+    let original_key_pubkey_sha1 = all_images
+        .iter()
+        .find_map(|path| read_image_pubkey_sha1(path).ok().flatten());
 
     // Resolve --rollback. The flag's purpose is to override the AVB
     // rollback_index on boot.img / vbmeta_system.img so an older firmware can
@@ -2325,6 +2351,7 @@ where
     }
 
     let mut local_inode_cache = LocalInodeCache::default();
+    let mut prepared_vbmeta: BTreeMap<String, PreparedVbmetaResign> = BTreeMap::new();
 
     // Partitions whose ext4 data was mutated by SPL / fuck-lgsi / debloat.
     // dm-verity is regenerated for each exactly once, after all mutating ops,
@@ -2342,6 +2369,19 @@ where
         )?;
         let vendor_path = out_dir.join("vendor.img");
         let vbmeta_path = out_dir.join("vbmeta.img");
+        let vendor_spl_will_change = crate::vendor_spl::read_vendor_avb_property(&vendor_path)?
+            .is_some_and(|current| new_spl > current.as_str());
+        if vendor_spl_will_change {
+            prepare_vbmeta_mutation(
+                "vbmeta.img",
+                out_dir,
+                config,
+                effective_rollback,
+                &mut local_inode_cache,
+                &mut images,
+                &mut prepared_vbmeta,
+            )?;
+        }
         // Data-only bump; dm-verity is regenerated later by the deferred pass.
         match apply_vendor_spl_mutation(&vendor_path, &vbmeta_path, new_spl)? {
             SplMutationOutcome::Patched { old, new } => {
@@ -2414,6 +2454,19 @@ where
         )?;
         let system_path = out_dir.join("system.img");
         let vbmeta_system_path = out_dir.join("vbmeta_system.img");
+        let system_spl_will_change = crate::system_spl::read_system_avb_property(&system_path)?
+            .is_some_and(|current| new_spl > current.as_str());
+        if system_spl_will_change {
+            prepare_vbmeta_mutation(
+                "vbmeta_system.img",
+                out_dir,
+                config,
+                effective_rollback,
+                &mut local_inode_cache,
+                &mut images,
+                &mut prepared_vbmeta,
+            )?;
+        }
         match apply_system_spl_mutation(&system_path, &vbmeta_system_path, new_spl)? {
             SplMutationOutcome::Patched { old, new } => {
                 message(
@@ -2719,18 +2772,34 @@ where
     // once (coalescing --system-spl / --fuck-lgsi / --debloat that touched the
     // same partition), propagate the new root digest to the footer + owning
     // vbmeta, and back-fill the report entries that record a verity change.
+    // Signed owning VBMeta images are verified/re-signed before their first
+    // descriptor write, then authenticated after all writes in the main loop.
     for (partition, image_path) in &dirty_partitions {
-        let Some((old_hex, new_hex)) = finalize_partition_verity(
-            events,
-            out_dir,
-            partition,
-            image_path,
-            &mut local_inode_cache,
-            &mut images,
-        )?
+        let Some(finalized) = finalize_partition_verity(events, out_dir, partition, image_path)?
         else {
             continue;
         };
+        let FinalizedPartitionVerity {
+            old_hex,
+            new_hex,
+            pending_vbmeta_patch,
+        } = finalized;
+        if let Some(patch) = pending_vbmeta_patch {
+            prepare_vbmeta_mutation(
+                &patch.image_name,
+                out_dir,
+                config,
+                effective_rollback,
+                &mut local_inode_cache,
+                &mut images,
+                &mut prepared_vbmeta,
+            )?;
+            crate::avb_descriptor::patch_hashtree_root_digest(
+                &out_dir.join(&patch.image_name),
+                &patch.partition_name,
+                &patch.root_digest,
+            )?;
+        }
         if partition == "system" {
             if let Some(lgsi) = report.lgsi.as_mut() {
                 lgsi.old_root_digest = old_hex.clone();
@@ -2787,9 +2856,6 @@ where
     let new_key_pubkey_sha1 = avbtool_rs::crypto::load_key_from_spec(&config.key)
         .ok()
         .map(|k| k.public_key_sha1());
-    let original_key_pubkey_sha1 = images
-        .iter()
-        .find_map(|p| read_image_pubkey_sha1(p).ok().flatten());
 
     let mut resigned_count = 0usize;
     let mut skipped_unsigned_count = 0usize;
@@ -2814,7 +2880,9 @@ where
         local_inode_cache.ensure(&out_path)?;
 
         let mut boot_spl_outcome = None;
-        let result: anyhow::Result<_> = if filename == "boot.img"
+        let result: anyhow::Result<_> = if let Some(prepared) = prepared_vbmeta.remove(&filename) {
+            prepared.finish()
+        } else if filename == "boot.img"
             && let Some(new_spl) = config.boot_spl.as_deref()
         {
             resign_image_with_security_patch(
@@ -2966,6 +3034,17 @@ where
                 }
             }
         }
+    }
+
+    if !prepared_vbmeta.is_empty() {
+        return Err(anyhow::anyhow!(
+            "prepared VBMeta image(s) were not finalized by the resign loop: {}",
+            prepared_vbmeta
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     if let Some(ri) = effective_rollback {
@@ -3588,12 +3667,10 @@ fn ensure_images_local(
     Ok(())
 }
 
-/// Append `out_dir/image_name` to `images` if it isn't already listed
-/// by basename. The `--vendor-spl` and `--fuck-lgsi` blocks both need
-/// to make sure the resign loop refreshes a stale signature their
-/// in-place AVB descriptor patch leaves behind, even when an unrelated
-/// filter (e.g. `--rollback`) would otherwise drop the corresponding
-/// vbmeta image from the resign list.
+/// Append `out_dir/image_name` to `images` if it isn't already listed by
+/// basename. Prepared VBMeta images must reach the main loop so their final
+/// descriptor bytes receive a refreshed authentication block, even when an
+/// unrelated filter (e.g. `--rollback`) would otherwise omit them.
 fn ensure_image_in_resign_list(images: &mut Vec<PathBuf>, out_dir: &Path, image_name: &str) {
     let already_listed = images.iter().any(|p| {
         p.file_name()
@@ -3604,6 +3681,43 @@ fn ensure_image_in_resign_list(images: &mut Vec<PathBuf>, out_dir: &Path, image_
     if !already_listed {
         images.push(out_dir.join(image_name));
     }
+}
+
+/// Verify and re-sign a still-valid owning VBMeta before its first in-place
+/// descriptor mutation. Later mutations reuse the same prepared marker; the
+/// resign loop consumes it and authenticates the final descriptor bytes.
+fn prepare_vbmeta_mutation(
+    image_name: &str,
+    out_dir: &Path,
+    config: &ResignConfig,
+    effective_rollback: Option<u64>,
+    local_inode_cache: &mut LocalInodeCache,
+    images: &mut Vec<PathBuf>,
+    prepared: &mut BTreeMap<String, PreparedVbmetaResign>,
+) -> anyhow::Result<()> {
+    if prepared.contains_key(image_name) {
+        return Ok(());
+    }
+
+    let image_path = out_dir.join(image_name);
+    if !image_path.is_file() {
+        return Err(anyhow::anyhow!(
+            "cannot prepare missing VBMeta image {}",
+            image_path.display()
+        ));
+    }
+    local_inode_cache.ensure(&image_path)?;
+    let marker = prepare_vbmeta_for_descriptor_mutation(
+        &image_path,
+        &config.key,
+        config.algorithm.as_deref(),
+        config.force,
+        effective_rollback,
+    )
+    .with_context(|| format!("Failed to prepare {image_name} for descriptor mutation"))?;
+    ensure_image_in_resign_list(images, out_dir, image_name);
+    prepared.insert(image_name.to_string(), marker);
+    Ok(())
 }
 
 /// Wrap an `apply_*_with_progress` call so the dm-verity SHA-256 walk
