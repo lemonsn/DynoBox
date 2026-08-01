@@ -1,125 +1,104 @@
 # DynoBox
 
-Pure Rust firmware and OTA toolkit extracted from LTBox.
+[![License: Apache 2.0][license-shield]][license]
+[![Rust][rust-shield]][rust]
+[![Build][ci-shield]][ci]
+[![Latest release][release-shield]][releases]
+[![Downloads][downloads-shield]][releases]
 
-## What It Does
+DynoBox is a cross-platform toolkit for unpacking, modifying, re-signing, and
+repacking Android firmware and OTA packages. It provides both a desktop GUI and
+a command-line interface.
 
-- unpack dynamic partitions from split `super_*.img`
-- apply one or more OTA packages in sequence
-- re-sign AVB images with test keys
-- repack dynamic partitions back into split `super_*.img`
-- scan AVB metadata from one image or a whole directory
-- seal final outputs with a deterministic per-file SHA-256 manifest
-- bump boot, vendor & system security patch level
-- modify AVB rollback_index to bypass rollback protection
-- toggle any LGSI feature flag at its registration site
+## ⚠️ Disclaimer
 
-## Current Commands
+**For educational and development purposes only.** Modifying firmware can brick
+your device, cause data loss, weaken device security, or void your warranty. The
+author assumes **no liability** for any damage or loss. You are solely
+responsible for how you use this software.
+
+**Use at your own risk.**
+
+---
+
+## Quick Start
+
+![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
+![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
+
+Download and extract the archive for your platform from
+**[GitHub Releases][releases]**.
+
+- Run `dynobox` without arguments to open the GUI.
+- Run `dynobox --help` to use the CLI.
+
+---
+
+## What Can It Do?
+
+| Feature | What it does |
+|---|---|
+| **Firmware pipeline** | Unpack split `super` images, apply sequential OTA packages, and repack the result |
+| **AVB** | Inspect, re-sign, and verify AVB images; update rollback indexes and security patch levels |
+| **Firmware customization** | Toggle Lenovo LGSI flags, remove selected system files, and apply repeatable `.dbp` patches |
+| **Verification** | Validate images, XML, and `super` consistency and generate SHA-256 output manifests |
+| **Automation** | Provide JSONL progress output and optional Ed25519-signed manifests for scripted workflows |
+
+DynoBox modifies supported ext4 partition images directly; mounting them is not
+required.
+
+---
+
+## Usage
+
+The GUI exposes the common pipeline options and can launch the same operation
+in a terminal. For full control, use the CLI directly.
+
+### Apply an OTA and rebuild the firmware
 
 ```powershell
-dynobox unpack --input <firmware_dir> [--output <dir>] [--integrity-key <private.pem>]
-dynobox apply --input <firmware_dir> [--output <dir>] [--integrity-key <private.pem>] <ota1.zip> ...
-dynobox resign --input <image_dir> [--output <dir>] --key <key> [--integrity-key <private.pem>] [--force] [--rollback <unix_ts>] [--boot-spl <YYYY-MM-DD>] [--vendor-spl <YYYY-MM-DD>] [--system-spl <YYYY-MM-DD>] [--fuck-lgsi [<JSON_PATH>]]
-dynobox repack --input <image_dir> [--output <dir>] [--integrity-key <private.pem>]
-dynobox info --input <image_or_dir> [--format text|json] [--output <report.txt>]
-dynobox verify --input <image_or_dir> [--trusted-integrity-key <public.pem>] [--format text|json] [--output <report.txt>]
-dynobox integrity-keygen --private-key <private.pem> [--public-key <public.pem>]
+.\dynobox.exe apply `
+    --input .\firmware\image `
+    --output .\output `
+    --resign `
+    --repack `
+    --complete `
+    --key testkey_rsa4096 `
+    .\update.zip
 ```
 
-Pipeline stage keywords (`unpack`, `resign`, `repack`) can be written as bare words or with `--` prefix. Both forms work.
+Multiple OTA packages may be listed in installation order. DynoBox
+automatically unpacks dynamic partitions when the input contains split
+`super_*.img` files.
 
-### GUI mode
-
-The shipped `dynobox` binary is **dual-mode**. Run it with any
-arguments and it behaves exactly like the CLI documented above. Run
-it with no arguments (e.g. double-click `dynobox.exe`) and it opens a
-minimal egui front-end instead — mode dropdown, folder / file
-pickers, OTA-zip list with drag-and-drop reordering, resign-options
-panel that auto-greys when resign isn't selected, and a "Run in
-terminal" button that spawns the same binary in a fresh OS terminal
-window.
-
-The crate is `crates/dyno-gui` and builds as `dynobox-gui[.exe]`
-locally; CI / release rename the artifact to `dynobox[.exe]` so a
-single binary covers both flows.
-
-### Pipeline Example
-
-```powershell
-dynobox apply `
-    --input TB322_ZUXOS_1.5.10.063_Tool\image `
-    063to117.zip 117to183.zip `
-    resign --key testkey_rsa4096 `
-    repack `
-    --output TB322_ZUXOS_1.5.10.183_Resigned `
-    --complete
-```
-
-### Pipeline Behavior
-
-- Stage order is always: **unpack → apply → resign → repack**
-- When the input directory has super chunks but no standalone dynamic partition files, `apply`, `resign`, and `repack` auto-unpack super before proceeding.
-- After repack, standalone dynamic partition images (system.img, vendor.img, etc.) are removed from the final output since they are packed inside the new super chunks.
-- `--complete` copies all remaining input files to the output so it mirrors the original firmware structure.
-- Intermediate stage folders are temporary and auto-cleaned. Final output directory follows last stage unless `--output` is set.
-- `apply` runs a preflight scan before patching and a postflight verification pass after output is written.
-- After final AVB/XML/super verification, every successful output pipeline writes `dynobox-manifest.json` with the size and SHA-256 of every tracked final artifact, including `report.html` when present. When the pipeline includes resign, the root `abl.elf` is intentionally excluded and the manifest records `resign_performed: true`; non-resign pipelines continue to inventory it. Builds made from a Git checkout record the exact source revision (and a `dirty` marker for uncommitted sources) in both the manifest and report.
-- `--integrity-key` adds a detached `dynobox-manifest.sig` Ed25519 signature. Use a dedicated manifest-signing key rather than the Android AVB key; publish or pin the generated public key separately from the firmware output.
-- All pipeline commands support `--progress-format text|jsonl` for machine-readable progress.
-- `verify` checks the manifest automatically when present, reports modified/missing/unexpected files separately from firmware semantic checks, and distinguishes unsigned, valid-untrusted, and trusted signatures. Supplying `--trusted-integrity-key` makes an unsigned or differently signed manifest a verification failure. Older outputs without a manifest remain supported and are marked `NOT CHECKED` for artifact integrity.
-
-## Workspace Layout
+### Common commands
 
 ```text
-crates/
-  dyno-app/      app-layer orchestration and progress events
-  dyno-cli/      CLI parsing + pipeline driver (lib + thin bin wrapper)
-  dyno-core/     shared core types
-  dyno-gui/      egui front-end; ships as the `dynobox` release binary
-  dyno-super/    super parsing and repack
-  dyno-payload/  OTA payload parsing and patch apply
-  dyno-xml/      rawprogram XML parsing
+dynobox unpack             Unpack dynamic partitions from super
+dynobox apply              Apply one or more OTA packages
+dynobox resign             Re-sign and customize firmware images
+dynobox repack             Rebuild split super images
+dynobox info               Show AVB metadata
+dynobox verify             Verify firmware and output integrity
+dynobox integrity-keygen   Generate a manifest-signing keypair
 ```
 
-## Build
+Use `dynobox <command> --help` for every option, including `--boot-spl`,
+`--vendor-spl`, `--system-spl`, `--fuck-lgsi`, `--debloat`, and `--plus`.
 
-```powershell
-cargo fmt
-cargo build -p dynobox-gui   # dual-mode binary; release artifact gets renamed to `dynobox[.exe]`
-cargo test --workspace --locked
-cargo deny check             # advisory / license / source policy (deny.toml)
-```
+---
 
-### Install from a release
+## License
 
-GitHub Releases (tag `v*`) publish self-contained archives after the tag is
-matched to the Cargo workspace version and fmt, clippy (`-D warnings`),
-workspace tests, and `cargo deny` all pass. Each packaged binary is unpacked
-and smoke-tested on its native runner before upload. A manual
-`workflow_dispatch` performs the same packaging checks without creating a
-release. Each archive includes `README.md`, `LICENSE`, and a matching `.sha256`
-checksum file:
+DynoBox is licensed under the [Apache License 2.0][license].
 
-| Platform | Artifact |
-| --- | --- |
-| Windows x86_64 / arm64 | `DynoBox-windows_<arch>-vX.Y.Z.zip` → `dynobox.exe` (+ `README.md`, `LICENSE`) |
-| Linux x86_64 / arm64 | `DynoBox-linux_<arch>-vX.Y.Z.tar.gz` → `dynobox` (mode preserved; + `README.md`, `LICENSE`) |
-| macOS universal | `DynoBox-macos_universal-vX.Y.Z.zip` → `DynoBox.app` (`Contents/MacOS/dynobox`; `README.md` + `LICENSE` in `Contents/Resources/`) |
-
-Tag releases also include a combined `SHA256SUMS` file and GitHub build
-provenance covering all five platform archives. Check the downloaded files
-with `sha256sum --check SHA256SUMS`; when the GitHub CLI is available, verify
-provenance with
-`gh attestation verify <archive> --repo miner7222/DynoBox`.
-
-On macOS, open the app once via right-click → Open (or clear quarantine with
-`xattr -dr com.apple.quarantine DynoBox.app`) if Gatekeeper blocks an ad-hoc
-signed download. Extract yields a single `DynoBox.app`; docs live inside the
-bundle under `Contents/Resources/` so drag-to-Applications stays clean. Local
-packaging helper: `misc/macos/make-app.sh`.
-
-## Current Limits
-
-- standalone `ZUCCHINI` OTA ops not implemented
-- Puffin inner `ZUCCHINI` not implemented
-- `LZ4DIFF_PUFFDIFF` not implemented
+[license]: https://www.apache.org/licenses/LICENSE-2.0
+[license-shield]: https://img.shields.io/badge/License-Apache_2.0-blue.svg
+[rust]: https://www.rust-lang.org
+[rust-shield]: https://img.shields.io/badge/Rust-2024_edition-000000?logo=rust&logoColor=white
+[ci]: https://github.com/miner7222/DynoBox/actions/workflows/ci.yml
+[ci-shield]: https://img.shields.io/github/actions/workflow/status/miner7222/DynoBox/ci.yml?branch=main&label=build&logo=github
+[releases]: https://github.com/miner7222/DynoBox/releases/latest
+[release-shield]: https://img.shields.io/github/v/release/miner7222/DynoBox?logo=github
+[downloads-shield]: https://img.shields.io/github/downloads/miner7222/DynoBox/total?logo=github
