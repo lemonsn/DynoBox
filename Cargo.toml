@@ -93,3 +93,13 @@ regex_creation_in_loops = "allow"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# OTA partition verification is frequently exercised through `target/debug`
+# during firmware development. Keep RustCrypto SHA-256 hardware dispatch and
+# compression optimized there; the rest of the workspace retains fast debug
+# builds and full debug assertions.
+[profile.dev.package."sha2:0.11.0"]
+opt-level = 3
+
+[profile.test.package."sha2:0.11.0"]
+opt-level = 3

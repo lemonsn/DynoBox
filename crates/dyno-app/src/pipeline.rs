@@ -1307,6 +1307,17 @@ where
                 item: p_info.name.clone(),
             });
 
+            validate_partition_digest_metadata(
+                p_info.old_size,
+                &p_info.old_hash,
+                &format!("old partition `{}`", p_info.name),
+            )?;
+            validate_partition_digest_metadata(
+                p_info.new_size,
+                &p_info.new_hash,
+                &format!("new partition `{}`", p_info.name),
+            )?;
+
             let split_fragments = find_split_source_fragments(&catalog, &p_info.name);
             if !split_fragments.is_empty() && p_info.old_size > 0 {
                 let all_present = split_fragments.iter().all(|f| {
@@ -1337,22 +1348,6 @@ where
                         p_info.old_size,
                         &recon_src,
                     )?;
-                    // Split reconstruction materializes a logical image of
-                    // `old_size` with implicit zero padding for holes; validate
-                    // against the payload's old_partition_info before applying.
-                    validate_partition_image_digest_with_event_progress(
-                        events,
-                        OtaDigestProgress {
-                            current: partition_index + 1,
-                            total: metadata.partitions.len(),
-                            item: &format!("{}: verify OTA source digest", p_info.name),
-                        },
-                        &recon_src,
-                        p_info.old_size,
-                        &p_info.old_hash,
-                        &format!("old partition `{}` (split source)", p_info.name),
-                        PartitionSizePolicy::AllowSourceContainer,
-                    )?;
                     let temp_new = working_dir.join(format!("{}_new.img", p_info.name));
                     apply_payload_with_event_progress(
                         events,
@@ -1363,18 +1358,28 @@ where
                         &temp_new,
                         metadata.block_size,
                     )?;
-                    validate_partition_image_digest_with_event_progress(
+                    verify_applied_partition_digests_with_event_progress(
                         events,
-                        OtaDigestProgress {
-                            current: partition_index + 1,
-                            total: metadata.partitions.len(),
-                            item: &format!("{}: verify OTA target digest", p_info.name),
+                        partition_index + 1,
+                        metadata.partitions.len(),
+                        &p_info.name,
+                        PartitionDigestSpec {
+                            path: &temp_new,
+                            size: p_info.new_size,
+                            hash: &p_info.new_hash,
+                            label: &format!(
+                                "new partition `{}` (split reconstruction)",
+                                p_info.name
+                            ),
+                            size_policy: PartitionSizePolicy::Exact,
                         },
-                        &temp_new,
-                        p_info.new_size,
-                        &p_info.new_hash,
-                        &format!("new partition `{}` (split reconstruction)", p_info.name),
-                        PartitionSizePolicy::Exact,
+                        PartitionDigestSpec {
+                            path: &recon_src,
+                            size: p_info.old_size,
+                            hash: &p_info.old_hash,
+                            label: &format!("old partition `{}` (split source)", p_info.name),
+                            size_policy: PartitionSizePolicy::AllowSourceContainer,
+                        },
                     )?;
                     split_new_image_to_fragments(&temp_new, &split_fragments, out_dir)?;
                     let _ = std::fs::remove_file(&recon_src);
@@ -1463,28 +1468,6 @@ where
                 anyhow::bail!("Source image for {} ({}) not found.", p_info.name, filename);
             }
 
-            // Validate the base image against old_partition_info when present.
-            // Size/hash metadata may be partially populated: empty hash with
-            // old_size==0 is "absent"; old_size>0 is always enforced (source
-            // images may be shorter than the logical size, or longer containers
-            // with ignored tails such as Qualcomm MELF trailers). A non-empty
-            // hash with zero size is treated as malformed.
-            if src_path.exists() && (p_info.old_size > 0 || !p_info.old_hash.is_empty()) {
-                validate_partition_image_digest_with_event_progress(
-                    events,
-                    OtaDigestProgress {
-                        current: partition_index + 1,
-                        total: metadata.partitions.len(),
-                        item: &format!("{}: verify OTA source digest", p_info.name),
-                    },
-                    &src_path,
-                    p_info.old_size,
-                    &p_info.old_hash,
-                    &format!("old partition `{}`", p_info.name),
-                    PartitionSizePolicy::AllowSourceContainer,
-                )?;
-            }
-
             let temp_new = working_dir.join(format!("{}_new.img", p_info.name));
             apply_payload_with_event_progress(
                 events,
@@ -1495,18 +1478,25 @@ where
                 &temp_new,
                 metadata.block_size,
             )?;
-            validate_partition_image_digest_with_event_progress(
+            verify_applied_partition_digests_with_event_progress(
                 events,
-                OtaDigestProgress {
-                    current: partition_index + 1,
-                    total: metadata.partitions.len(),
-                    item: &format!("{}: verify OTA target digest", p_info.name),
+                partition_index + 1,
+                metadata.partitions.len(),
+                &p_info.name,
+                PartitionDigestSpec {
+                    path: &temp_new,
+                    size: p_info.new_size,
+                    hash: &p_info.new_hash,
+                    label: &format!("new partition `{}`", p_info.name),
+                    size_policy: PartitionSizePolicy::Exact,
                 },
-                &temp_new,
-                p_info.new_size,
-                &p_info.new_hash,
-                &format!("new partition `{}`", p_info.name),
-                PartitionSizePolicy::Exact,
+                PartitionDigestSpec {
+                    path: &src_path,
+                    size: p_info.old_size,
+                    hash: &p_info.old_hash,
+                    label: &format!("old partition `{}`", p_info.name),
+                    size_policy: PartitionSizePolicy::AllowSourceContainer,
+                },
             )?;
             move_file_across_drives(&temp_new, &out_path)?;
             trim_trailing_zero_padding(&out_path, input.join(&filename).as_path())?;
@@ -3984,20 +3974,10 @@ fn validate_partition_image_digest_inner(
     size_policy: PartitionSizePolicy,
     progress: Option<&mut dyn FnMut(u64, u64)>,
 ) -> anyhow::Result<()> {
+    validate_partition_digest_metadata(expected_size, expected_hash, label)?;
     if expected_hash.is_empty() && expected_size == 0 {
         // Fully absent PartitionInfo metadata.
         return Ok(());
-    }
-    if !expected_hash.is_empty() && expected_size == 0 {
-        anyhow::bail!(
-            "{label}: malformed PartitionInfo metadata (non-empty digest with logical size 0)"
-        );
-    }
-    if !expected_hash.is_empty() && expected_hash.len() != PAYLOAD_SHA256_LEN {
-        anyhow::bail!(
-            "{label}: malformed digest length {} (expected {PAYLOAD_SHA256_LEN} for SHA-256)",
-            expected_hash.len()
-        );
     }
     if !path.exists() {
         anyhow::bail!(
@@ -4031,6 +4011,104 @@ fn validate_partition_image_digest_inner(
         );
     }
     Ok(())
+}
+
+fn validate_partition_digest_metadata(
+    expected_size: u64,
+    expected_hash: &[u8],
+    label: &str,
+) -> anyhow::Result<()> {
+    if !expected_hash.is_empty() && expected_size == 0 {
+        anyhow::bail!(
+            "{label}: malformed PartitionInfo metadata (non-empty digest with logical size 0)"
+        );
+    }
+    if !expected_hash.is_empty() && expected_hash.len() != PAYLOAD_SHA256_LEN {
+        anyhow::bail!(
+            "{label}: malformed digest length {} (expected {PAYLOAD_SHA256_LEN} for SHA-256)",
+            expected_hash.len()
+        );
+    }
+    Ok(())
+}
+
+/// AOSP update_engine verifies the completed target partition first. The full
+/// source partition is hashed only after a target mismatch so it can distinguish
+/// a wrong base image from a faulty target reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OtaPartitionDigest {
+    Target,
+    Source,
+}
+
+fn verify_target_before_source<F>(has_source_digest: bool, mut verify: F) -> anyhow::Result<()>
+where
+    F: FnMut(OtaPartitionDigest) -> anyhow::Result<()>,
+{
+    let target_error = match verify(OtaPartitionDigest::Target) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !has_source_digest {
+        return Err(target_error);
+    }
+
+    match verify(OtaPartitionDigest::Source) {
+        Ok(()) => Err(target_error)
+            .context("OTA source digest matches; the applied target partition is invalid"),
+        Err(source_error) => Err(source_error)
+            .with_context(|| format!("OTA target verification also failed: {target_error:#}")),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PartitionDigestSpec<'a> {
+    path: &'a Path,
+    size: u64,
+    hash: &'a [u8],
+    label: &'a str,
+    size_policy: PartitionSizePolicy,
+}
+
+fn verify_applied_partition_digests_with_event_progress<S>(
+    events: &mut S,
+    current: usize,
+    total: usize,
+    partition_name: &str,
+    target: PartitionDigestSpec<'_>,
+    source: PartitionDigestSpec<'_>,
+) -> anyhow::Result<()>
+where
+    S: EventSink + ?Sized,
+{
+    verify_target_before_source(!source.hash.is_empty(), |kind| match kind {
+        OtaPartitionDigest::Target => validate_partition_image_digest_with_event_progress(
+            events,
+            OtaDigestProgress {
+                current,
+                total,
+                item: &format!("{partition_name}: verify OTA target digest"),
+            },
+            target.path,
+            target.size,
+            target.hash,
+            target.label,
+            target.size_policy,
+        ),
+        OtaPartitionDigest::Source => validate_partition_image_digest_with_event_progress(
+            events,
+            OtaDigestProgress {
+                current,
+                total,
+                item: &format!("{partition_name}: diagnose OTA source digest"),
+            },
+            source.path,
+            source.size,
+            source.hash,
+            source.label,
+            source.size_policy,
+        ),
+    })
 }
 
 /// Validate one OTA partition digest with its own visible, determinate item.
@@ -5405,6 +5483,49 @@ mod tests {
             err.contains("SHA-256 mismatch"),
             "expected mismatch error, got: {err}"
         );
+    }
+
+    #[test]
+    fn ota_digest_verification_checks_source_only_after_target_failure() {
+        let mut checks = Vec::new();
+        verify_target_before_source(true, |kind| {
+            checks.push(kind);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(checks, vec![OtaPartitionDigest::Target]);
+
+        let mut checks = Vec::new();
+        let error = verify_target_before_source(true, |kind| {
+            checks.push(kind);
+            match kind {
+                OtaPartitionDigest::Target => anyhow::bail!("target mismatch"),
+                OtaPartitionDigest::Source => Ok(()),
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            checks,
+            vec![OtaPartitionDigest::Target, OtaPartitionDigest::Source]
+        );
+        assert!(format!("{error:#}").contains("target mismatch"));
+
+        let mut checks = Vec::new();
+        let error = verify_target_before_source(true, |kind| {
+            checks.push(kind);
+            match kind {
+                OtaPartitionDigest::Target => anyhow::bail!("target mismatch"),
+                OtaPartitionDigest::Source => anyhow::bail!("source mismatch"),
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            checks,
+            vec![OtaPartitionDigest::Target, OtaPartitionDigest::Source]
+        );
+        let error = format!("{error:#}");
+        assert!(error.contains("source mismatch"));
+        assert!(error.contains("target mismatch"));
     }
 
     #[test]

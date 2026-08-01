@@ -2,6 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use crate::payload::proto::{Extent, InstallOperation, install_operation::Type};
 use crate::puffin::{PuffPatchKind, apply_puffpatch_bytes, inspect_puff_patch_type};
 use dynobox_core::error::{DynoError, Result};
@@ -15,6 +17,47 @@ use dynobox_core::error::{DynoError, Result};
 /// legitimate single-op REPLACE payloads, small enough to reject pathological
 /// allocation attempts. Exact-size equality is still enforced under this cap.
 const MAX_REPLACE_DECOMPRESS_BYTES: u64 = 512 * 1024 * 1024;
+const SHA256_DIGEST_LEN: usize = 32;
+
+fn validate_sha256_len(label: &str, expected_hash: &[u8]) -> Result<()> {
+    if expected_hash.len() != SHA256_DIGEST_LEN {
+        return Err(DynoError::Tool(format!(
+            "{label} SHA-256 has {} bytes; expected {SHA256_DIGEST_LEN}",
+            expected_hash.len()
+        )));
+    }
+    Ok(())
+}
+
+fn compare_sha256(label: &str, actual_hash: &[u8], expected_hash: &[u8]) -> Result<()> {
+    if actual_hash != expected_hash {
+        return Err(DynoError::Tool(format!(
+            "{label} SHA-256 mismatch: expected {}, got {}",
+            hex_encode(expected_hash),
+            hex_encode(actual_hash)
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sha256(label: &str, data: &[u8], expected_hash: Option<&[u8]>) -> Result<()> {
+    let Some(expected_hash) = expected_hash else {
+        return Ok(());
+    };
+    validate_sha256_len(label, expected_hash)?;
+    let actual_hash = Sha256::digest(data);
+    compare_sha256(label, &actual_hash, expected_hash)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
 
 /// Read from `reader` until EOF or `limit + 1` bytes, whichever comes first.
 /// Returning `limit + 1` lets the caller distinguish an exact-sized stream
@@ -100,6 +143,11 @@ impl Patcher {
     ) -> Result<()> {
         let op_type = Type::try_from(op.r#type)
             .map_err(|_| DynoError::Tool(format!("Unknown operation type: {}", op.r#type)))?;
+        validate_sha256(
+            "operation data",
+            payload_data,
+            op.data_sha256_hash.as_deref(),
+        )?;
 
         match op_type {
             Type::Replace => {
@@ -136,6 +184,11 @@ impl Patcher {
                 let src_fd = source_file.ok_or_else(|| {
                     DynoError::Tool("Source file required for SOURCE_COPY operation".into())
                 })?;
+                self.validate_source_extents_hash(
+                    src_fd,
+                    &op.src_extents,
+                    op.src_sha256_hash.as_deref(),
+                )?;
                 self.copy_extents(src_fd, target_file, &op.src_extents, &op.dst_extents)?;
             }
             #[allow(deprecated)]
@@ -149,6 +202,7 @@ impl Patcher {
                     &op.src_extents,
                     &op.dst_extents,
                     payload_data,
+                    op.src_sha256_hash.as_deref(),
                 )?;
             }
             Type::Lz4diffBsdiff => {
@@ -166,6 +220,7 @@ impl Patcher {
                     &op.src_extents,
                     &op.dst_extents,
                     &decompressed_patch,
+                    op.src_sha256_hash.as_deref(),
                 )?;
             }
             Type::Puffdiff => {
@@ -178,6 +233,7 @@ impl Patcher {
                     &op.src_extents,
                     &op.dst_extents,
                     payload_data,
+                    op.src_sha256_hash.as_deref(),
                 )?;
             }
             Type::Lz4diffPuffdiff => {
@@ -406,6 +462,47 @@ impl Patcher {
         Ok(data)
     }
 
+    fn validate_source_extents_hash(
+        &self,
+        file: &mut File,
+        extents: &[Extent],
+        expected_hash: Option<&[u8]>,
+    ) -> Result<()> {
+        let Some(expected_hash) = expected_hash else {
+            return Ok(());
+        };
+        validate_sha256_len("operation source", expected_hash)?;
+        let file_len = file.metadata()?.len();
+        self.validate_extents_within_file(extents, file_len, "source")?;
+
+        let mut hasher = Sha256::new();
+        SCRATCH_BUFFER.with(|cell| -> Result<()> {
+            let mut buffer = cell.borrow_mut();
+            if buffer.is_empty() {
+                buffer.resize(1024 * 1024, 0);
+            }
+            for extent in extents {
+                let (offset, mut remaining) = self.extent_byte_range(extent)?;
+                file.seek(SeekFrom::Start(offset))?;
+                while remaining > 0 {
+                    let chunk =
+                        usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
+                            DynoError::Tool("source hash chunk exceeds addressable memory".into())
+                        })?;
+                    file.read_exact(&mut buffer[..chunk])?;
+                    hasher.update(&buffer[..chunk]);
+                    remaining -= chunk as u64;
+                }
+            }
+            Ok(())
+        })?;
+        compare_sha256(
+            "operation source",
+            hasher.finalize().as_slice(),
+            expected_hash,
+        )
+    }
+
     fn apply_bsdiff_android(
         &self,
         src: &mut File,
@@ -413,8 +510,10 @@ impl Patcher {
         src_extents: &[Extent],
         dst_extents: &[Extent],
         patch_data: &[u8],
+        expected_source_hash: Option<&[u8]>,
     ) -> Result<()> {
         let src_data = self.read_extents_to_vec(src, src_extents)?;
+        validate_sha256("operation source", &src_data, expected_source_hash)?;
         let mut patched_data = Vec::new();
 
         bsdiff_android::patch_bsdf2(&src_data, patch_data, &mut patched_data)
@@ -440,8 +539,10 @@ impl Patcher {
         src_extents: &[Extent],
         dst_extents: &[Extent],
         patch_data: &[u8],
+        expected_source_hash: Option<&[u8]>,
     ) -> Result<()> {
         let src_data = self.read_extents_to_vec(src, src_extents)?;
+        validate_sha256("operation source", &src_data, expected_source_hash)?;
         let patched_data = apply_puffpatch_bytes(&src_data, patch_data)?;
 
         let expected_size = self.count_extents_size(dst_extents)?;
@@ -1055,6 +1156,19 @@ mod tests {
         }
     }
 
+    fn test_temp_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "dynobox-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
     #[test]
     fn reports_standalone_zucchini_as_unsupported() {
         let op = InstallOperation {
@@ -1090,6 +1204,114 @@ mod tests {
         let info = inspect_operation_support(&op, &minimal_puff_patch(PatchType::Bsdiff)).unwrap();
         assert_eq!(info.detail_name, "PUFFDIFF(BSDIFF)");
         assert!(info.unsupported_reason.is_none());
+    }
+
+    #[test]
+    fn corrupt_operation_data_hash_is_rejected_before_write() {
+        use sha2::{Digest, Sha256};
+
+        let dir = test_temp_dir("operation-data-hash");
+        let target_path = dir.join("target.img");
+        fs::write(&target_path, [0u8; 4]).unwrap();
+        let mut target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target_path)
+            .unwrap();
+        let mut wrong_hash = Sha256::digest(b"data").to_vec();
+        wrong_hash[0] ^= 0xff;
+        let operation = InstallOperation {
+            r#type: Type::Replace as i32,
+            dst_extents: vec![extent(0, 4)],
+            data_sha256_hash: Some(wrong_hash),
+            ..Default::default()
+        };
+
+        let error = Patcher::new(1)
+            .apply_operation(&operation, b"data", None, &mut target)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("operation data SHA-256 mismatch"), "{error}");
+        assert_eq!(fs::read(target_path).unwrap(), [0u8; 4]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_operation_source_hash_is_rejected_before_write() {
+        let dir = test_temp_dir("operation-source-hash");
+        let source_path = dir.join("source.img");
+        let target_path = dir.join("target.img");
+        fs::write(&source_path, b"source").unwrap();
+        fs::write(&target_path, [0u8; 6]).unwrap();
+        let mut source = std::fs::File::open(source_path).unwrap();
+        let mut target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target_path)
+            .unwrap();
+        let operation = InstallOperation {
+            r#type: Type::SourceCopy as i32,
+            src_extents: vec![extent(0, 6)],
+            dst_extents: vec![extent(0, 6)],
+            src_sha256_hash: Some(vec![0u8; 32]),
+            ..Default::default()
+        };
+
+        let error = Patcher::new(1)
+            .apply_operation(&operation, &[], Some(&mut source), &mut target)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("operation source SHA-256 mismatch"),
+            "{error}"
+        );
+        assert_eq!(fs::read(target_path).unwrap(), [0u8; 6]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn valid_operation_hashes_allow_replace_and_source_copy() {
+        use sha2::{Digest, Sha256};
+
+        let dir = test_temp_dir("valid-operation-hashes");
+        let source_path = dir.join("source.img");
+        let target_path = dir.join("target.img");
+        fs::write(&source_path, b"abcdefgh").unwrap();
+        fs::write(&target_path, [0u8; 8]).unwrap();
+        let mut source = std::fs::File::open(&source_path).unwrap();
+        let mut target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&target_path)
+            .unwrap();
+
+        let replace_data = b"WXYZ";
+        let replace = InstallOperation {
+            r#type: Type::Replace as i32,
+            dst_extents: vec![extent(0, 4)],
+            data_sha256_hash: Some(Sha256::digest(replace_data).to_vec()),
+            ..Default::default()
+        };
+        Patcher::new(1)
+            .apply_operation(&replace, replace_data, None, &mut target)
+            .unwrap();
+
+        let source_bytes = b"efgh";
+        let source_copy = InstallOperation {
+            r#type: Type::SourceCopy as i32,
+            src_extents: vec![extent(4, 2), extent(6, 2)],
+            dst_extents: vec![extent(4, 4)],
+            src_sha256_hash: Some(Sha256::digest(source_bytes).to_vec()),
+            ..Default::default()
+        };
+        Patcher::new(1)
+            .apply_operation(&source_copy, &[], Some(&mut source), &mut target)
+            .unwrap();
+
+        assert_eq!(fs::read(target_path).unwrap(), b"WXYZefgh");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
