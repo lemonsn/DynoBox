@@ -25,8 +25,9 @@
 //!   call `super`, `finish()`, broadcast an existing action string, and return.
 //! * [`patch_method_code`] — atomically apply ordered, exact same-length byte
 //!   replacements inside one fully-qualified method body. This is the escape
-//!   hatch for firmware-specific control-flow fixes that cannot be expressed
-//!   by the higher-level primitives without adding dex ids or code units.
+//!   hatch for control-flow fixes that cannot be expressed by the higher-level
+//!   primitives without adding dex ids or code units. DBP templates may resolve
+//!   their existing pool operands by descriptor before calling this primitive.
 //! * [`force_nop_anchored_invoke`] — nop the first
 //!   `target_class.target_method(...)` invoke (whose result is discarded)
 //!   that follows a specific constant load inside one scan method. Drops a
@@ -357,6 +358,128 @@ fn code_off_is_shared(dex: &[u8], h: &DexHeader, code_off: usize) -> Result<bool
         }
     }
     Ok(false)
+}
+
+/// A descriptor-resolved DEX pool entry used by symbolic method-code
+/// templates. Resolution is lookup-only: no string, type, field, or method id
+/// is ever inserted into the target DEX.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DexPoolSymbol<'a> {
+    String(&'a str),
+    Type(&'a str),
+    Field {
+        class: &'a str,
+        name: &'a str,
+        ty: &'a str,
+    },
+    Method {
+        class: &'a str,
+        name: &'a str,
+        ret: &'a str,
+        params: &'a [&'a str],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DexPoolSymbolKind {
+    String,
+    Type,
+    Field,
+    Method,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MethodCodeTemplateSlot {
+    pub offset: usize,
+    pub width: usize,
+    pub kind: DexPoolSymbolKind,
+}
+
+pub(crate) fn resolve_dex_pool_symbol(
+    dex: &[u8],
+    symbol: DexPoolSymbol<'_>,
+) -> Result<Option<u32>> {
+    let h = read_dex_header(dex);
+    match symbol {
+        DexPoolSymbol::String(value) => {
+            dex_walker::find_string_idx_strict(dex, h.string_ids_size, h.string_ids_off, value)
+        }
+        DexPoolSymbol::Type(descriptor) => dex_walker::find_type_idx(
+            dex,
+            h.string_ids_size,
+            h.string_ids_off,
+            h.type_ids_size,
+            h.type_ids_off,
+            descriptor,
+        ),
+        DexPoolSymbol::Field { class, name, ty } => resolve_field_idx(dex, &h, class, name, ty),
+        DexPoolSymbol::Method {
+            class,
+            name,
+            ret,
+            params,
+        } => resolve_method_idx(dex, &h, class, name, ret, params),
+    }
+}
+
+/// Validate that every symbolic slot occupies the complete reference operand
+/// of a supported Dalvik instruction. This prevents templates from treating
+/// opcodes, registers, branches, or literals as movable DEX indexes.
+pub(crate) fn validate_method_code_template_slots(
+    bytes: &[u8],
+    slots: &[MethodCodeTemplateSlot],
+) -> Result<()> {
+    let boundaries = instruction_boundaries(bytes)?;
+    if !boundaries.contains(&bytes.len()) {
+        return Err(anyhow!(
+            "method-code template must contain only whole Dalvik instructions"
+        ));
+    }
+
+    let mut occupied = BTreeSet::new();
+    for slot in slots {
+        let end = slot
+            .offset
+            .checked_add(slot.width)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| anyhow!("method-code template symbol exceeds template length"))?;
+        if (slot.offset..end).any(|offset| !occupied.insert(offset)) {
+            return Err(anyhow!("method-code template symbols overlap"));
+        }
+
+        let instruction_start = boundaries
+            .range(..=slot.offset)
+            .next_back()
+            .copied()
+            .ok_or_else(|| anyhow!("method-code template symbol is outside an instruction"))?;
+        if instruction_start == bytes.len() || slot.offset != instruction_start + 2 {
+            return Err(anyhow!(
+                "method-code template symbol is not a DEX reference operand"
+            ));
+        }
+        let opcode = bytes[instruction_start];
+        let expected = match opcode {
+            0x1a => Some((DexPoolSymbolKind::String, 2usize)),
+            0x1b => Some((DexPoolSymbolKind::String, 4usize)),
+            0x1c | 0x1f | 0x20 | 0x22..=0x25 => Some((DexPoolSymbolKind::Type, 2usize)),
+            0x52..=0x6d => Some((DexPoolSymbolKind::Field, 2usize)),
+            0x6e..=0x72 | 0x74..=0x78 => Some((DexPoolSymbolKind::Method, 2usize)),
+            _ => None,
+        };
+        let Some((expected_kind, expected_width)) = expected else {
+            return Err(anyhow!(
+                "method-code template symbol is not on a supported DEX reference instruction"
+            ));
+        };
+        if slot.kind != expected_kind || slot.width != expected_width {
+            return Err(anyhow!(
+                "method-code template {:?} symbol on opcode {opcode:#04x} does not accept u{}",
+                slot.kind,
+                slot.width * 8
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

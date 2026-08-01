@@ -34,7 +34,7 @@
 //! value = false
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -42,11 +42,13 @@ use memchr::memmem;
 use serde::Deserialize;
 
 use crate::dex_patch::{
-    MethodCodeReplacement, NopAnchor, force_field_const_bool, force_fragment_render_gone,
-    force_invoke_const_bool, force_invoke_const_int, force_method_broadcast_finish,
-    force_method_return_bool, force_method_return_int, force_method_return_void,
-    force_nop_anchored_invoke, force_remoteviews_gone, force_view_gone, parse_method_descriptor,
-    patch_method_code, redirect_intent_action_to_broadcast,
+    DexPoolSymbol, DexPoolSymbolKind, MethodCodeReplacement, MethodCodeTemplateSlot, NopAnchor,
+    force_field_const_bool, force_fragment_render_gone, force_invoke_const_bool,
+    force_invoke_const_int, force_method_broadcast_finish, force_method_return_bool,
+    force_method_return_int, force_method_return_void, force_nop_anchored_invoke,
+    force_remoteviews_gone, force_view_gone, parse_method_descriptor, patch_method_code,
+    redirect_intent_action_to_broadcast, resolve_dex_pool_symbol,
+    validate_method_code_template_slots,
 };
 use crate::ext4_helpers::{lookup_inode_at_path, open_ext4_volume, write_via_extents};
 use crate::fuck_lgsi::{
@@ -85,6 +87,64 @@ pub struct DbpCodeReplacement {
     pub to: String,
     #[serde(default = "default_expected_matches")]
     pub expected: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DbpCodeSymbol {
+    String {
+        name: String,
+        value: String,
+    },
+    Type {
+        name: String,
+        descriptor: String,
+    },
+    Field {
+        name: String,
+        class: String,
+        field: String,
+        ty: String,
+    },
+    Method {
+        name: String,
+        class: String,
+        method: String,
+        proto: String,
+    },
+}
+
+impl DbpCodeSymbol {
+    fn name(&self) -> &str {
+        match self {
+            Self::String { name, .. }
+            | Self::Type { name, .. }
+            | Self::Field { name, .. }
+            | Self::Method { name, .. } => name,
+        }
+    }
+
+    fn kind(&self) -> DexPoolSymbolKind {
+        match self {
+            Self::String { .. } => DexPoolSymbolKind::String,
+            Self::Type { .. } => DexPoolSymbolKind::Type,
+            Self::Field { .. } => DexPoolSymbolKind::Field,
+            Self::Method { .. } => DexPoolSymbolKind::Method,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbpCodeTemplateSlot {
+    name: String,
+    offset: usize,
+    width: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbpCodeTemplate {
+    bytes: Vec<u8>,
+    slots: Vec<DbpCodeTemplateSlot>,
 }
 
 /// A parsed `.dbp` document.
@@ -131,14 +191,17 @@ pub enum DbpOp {
         #[serde(default = "default_void_proto")]
         proto: String,
     },
-    /// Apply an ordered, atomic set of exact same-length instruction-byte
-    /// replacements inside one fully-qualified method body.
+    /// Apply an ordered, atomic set of same-length instruction-byte
+    /// replacements inside one fully-qualified method body. Named symbols may
+    /// materialize existing DEX pool indexes before exact matching.
     MethodCodePatch {
         partition: String,
         file: String,
         class: String,
         method: String,
         proto: String,
+        #[serde(default, rename = "symbol")]
+        symbols: Vec<DbpCodeSymbol>,
         #[serde(default, rename = "replacement")]
         replacements: Vec<DbpCodeReplacement>,
     },
@@ -404,10 +467,11 @@ pub fn load_dbp(path: &Path) -> Result<DbpDocument> {
                 class,
                 method,
                 proto,
+                symbols,
                 replacements,
                 ..
             } => {
-                if !(class.starts_with('L') && class.ends_with(';') && class.len() > 2) {
+                if !class_descriptor_is_valid(class) {
                     return Err(bail(format!(
                         "method_code_patch `class` must be a JVM descriptor like `Lcom/x/Y;`, got `{class}`"
                     )));
@@ -417,7 +481,7 @@ pub fn load_dbp(path: &Path) -> Result<DbpDocument> {
                         "method_code_patch `method` must not be empty".to_string(),
                     ));
                 }
-                if parse_method_descriptor(proto).is_none() {
+                if !full_method_descriptor_is_valid(proto) {
                     return Err(bail(format!(
                         "method_code_patch `proto` is not a valid JVM descriptor: `{proto}`"
                     )));
@@ -427,14 +491,79 @@ pub fn load_dbp(path: &Path) -> Result<DbpDocument> {
                         "method_code_patch requires at least one `replacement`".to_string(),
                     ));
                 }
+
+                let mut symbol_by_name = BTreeMap::new();
+                for symbol in symbols {
+                    if !symbol_name_is_valid(symbol.name()) {
+                        return Err(bail(format!(
+                            "method_code_patch has invalid symbol name `{}`",
+                            symbol.name()
+                        )));
+                    }
+                    if symbol_by_name.insert(symbol.name(), symbol).is_some() {
+                        return Err(bail(format!(
+                            "method_code_patch has duplicate symbol `{}`",
+                            symbol.name()
+                        )));
+                    }
+                    match symbol {
+                        DbpCodeSymbol::String { value, .. } => {
+                            if value.contains('\0') {
+                                return Err(bail(format!(
+                                    "method_code_patch symbol `{}` contains an unsupported NUL",
+                                    symbol.name()
+                                )));
+                            }
+                        }
+                        DbpCodeSymbol::Type { descriptor, .. } => {
+                            if !field_descriptor_is_valid(descriptor) {
+                                return Err(bail(format!(
+                                    "method_code_patch symbol `{}` has invalid type descriptor `{descriptor}`",
+                                    symbol.name()
+                                )));
+                            }
+                        }
+                        DbpCodeSymbol::Field {
+                            class, field, ty, ..
+                        } => {
+                            if !class_descriptor_is_valid(class)
+                                || field.is_empty()
+                                || !field_descriptor_is_valid(ty)
+                            {
+                                return Err(bail(format!(
+                                    "method_code_patch symbol `{}` has an invalid field descriptor",
+                                    symbol.name()
+                                )));
+                            }
+                        }
+                        DbpCodeSymbol::Method {
+                            class,
+                            method,
+                            proto,
+                            ..
+                        } => {
+                            if !class_descriptor_is_valid(class)
+                                || method.is_empty()
+                                || !full_method_descriptor_is_valid(proto)
+                            {
+                                return Err(bail(format!(
+                                    "method_code_patch symbol `{}` has an invalid method descriptor",
+                                    symbol.name()
+                                )));
+                            }
+                        }
+                    }
+                }
+
+                let mut used_symbols = BTreeSet::new();
                 for (index, replacement) in replacements.iter().enumerate() {
-                    let from = parse_hex_bytes(&replacement.from).map_err(|message| {
+                    let from = parse_code_template(&replacement.from).map_err(|message| {
                         bail(format!(
                             "method_code_patch replacement {} `from`: {message}",
                             index + 1
                         ))
                     })?;
-                    let to = parse_hex_bytes(&replacement.to).map_err(|message| {
+                    let to = parse_code_template(&replacement.to).map_err(|message| {
                         bail(format!(
                             "method_code_patch replacement {} `to`: {message}",
                             index + 1
@@ -446,18 +575,55 @@ pub fn load_dbp(path: &Path) -> Result<DbpDocument> {
                             index + 1
                         )));
                     }
-                    if from.is_empty() || from.len() % 2 != 0 || from.len() != to.len() {
+                    if from.bytes.is_empty()
+                        || from.bytes.len() % 2 != 0
+                        || from.bytes.len() != to.bytes.len()
+                    {
                         return Err(bail(format!(
                             "method_code_patch replacement {} must be non-empty, code-unit aligned, and size-preserving ({} != {})",
                             index + 1,
-                            from.len(),
-                            to.len()
+                            from.bytes.len(),
+                            to.bytes.len()
                         )));
                     }
                     if from == to {
                         return Err(bail(format!(
                             "method_code_patch replacement {} must change at least one byte",
                             index + 1
+                        )));
+                    }
+                    for template in [&from, &to] {
+                        let mut slots = Vec::with_capacity(template.slots.len());
+                        for slot in &template.slots {
+                            let Some(symbol) = symbol_by_name.get(slot.name.as_str()) else {
+                                return Err(bail(format!(
+                                    "method_code_patch replacement {} references undefined symbol `{}`",
+                                    index + 1,
+                                    slot.name
+                                )));
+                            };
+                            used_symbols.insert(slot.name.clone());
+                            slots.push(MethodCodeTemplateSlot {
+                                offset: slot.offset,
+                                width: slot.width,
+                                kind: symbol.kind(),
+                            });
+                        }
+                        validate_method_code_template_slots(&template.bytes, &slots).map_err(
+                            |error| {
+                                bail(format!(
+                                    "method_code_patch replacement {}: {error}",
+                                    index + 1
+                                ))
+                            },
+                        )?;
+                    }
+                }
+                for symbol in symbols {
+                    if !used_symbols.contains(symbol.name()) {
+                        return Err(bail(format!(
+                            "method_code_patch has unused symbol `{}`",
+                            symbol.name()
                         )));
                     }
                 }
@@ -721,18 +887,142 @@ fn validate_method_proto(
     }
 }
 
-fn parse_hex_bytes(value: &str) -> std::result::Result<Vec<u8>, String> {
-    value
-        .split_ascii_whitespace()
-        .map(|token| {
-            if token.len() != 2 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+fn parse_code_template(value: &str) -> std::result::Result<DbpCodeTemplate, String> {
+    let mut bytes = Vec::new();
+    let mut slots = Vec::new();
+    for token in value.split_ascii_whitespace() {
+        if let Some(body) = token
+            .strip_prefix("${")
+            .and_then(|body| body.strip_suffix('}'))
+        {
+            let Some((name, width)) = body.split_once(':') else {
                 return Err(format!(
-                    "invalid byte `{token}` (expected two hexadecimal digits)"
+                    "invalid symbol placeholder `{token}` (expected `${{name:u16}}` or `${{name:u32}}`)"
+                ));
+            };
+            if !symbol_name_is_valid(name) {
+                return Err(format!(
+                    "invalid symbol name `{name}` in placeholder `{token}`"
                 ));
             }
-            u8::from_str_radix(token, 16).map_err(|_| format!("invalid hexadecimal byte `{token}`"))
-        })
-        .collect()
+            let width = match width {
+                "u16" => 2,
+                "u32" => 4,
+                _ => {
+                    return Err(format!(
+                        "invalid symbol width in `{token}` (expected u16 or u32)"
+                    ));
+                }
+            };
+            slots.push(DbpCodeTemplateSlot {
+                name: name.to_string(),
+                offset: bytes.len(),
+                width,
+            });
+            bytes.resize(bytes.len() + width, 0);
+        } else {
+            if token.len() != 2 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "invalid byte `{token}` (expected two hexadecimal digits or a symbol placeholder)"
+                ));
+            }
+            bytes.push(
+                u8::from_str_radix(token, 16)
+                    .map_err(|_| format!("invalid hexadecimal byte `{token}`"))?,
+            );
+        }
+    }
+    Ok(DbpCodeTemplate { bytes, slots })
+}
+
+fn symbol_name_is_valid(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn class_descriptor_is_valid(descriptor: &str) -> bool {
+    descriptor.starts_with('L')
+        && descriptor.ends_with(';')
+        && descriptor.len() > 2
+        && !descriptor.bytes().any(|byte| byte.is_ascii_whitespace())
+}
+
+fn field_descriptor_is_valid(descriptor: &str) -> bool {
+    parse_method_descriptor(&format!("({descriptor})V"))
+        .is_some_and(|(ret, params)| ret == "V" && params == [descriptor])
+}
+
+fn full_method_descriptor_is_valid(descriptor: &str) -> bool {
+    parse_method_descriptor(descriptor).is_some_and(|(ret, params)| {
+        (ret == "V" || field_descriptor_is_valid(&ret))
+            && params.iter().all(|param| field_descriptor_is_valid(param))
+    })
+}
+
+fn resolve_code_symbol(dex: &[u8], symbol: &DbpCodeSymbol) -> Result<Option<u32>> {
+    match symbol {
+        DbpCodeSymbol::String { value, .. } => {
+            resolve_dex_pool_symbol(dex, DexPoolSymbol::String(value))
+        }
+        DbpCodeSymbol::Type { descriptor, .. } => {
+            resolve_dex_pool_symbol(dex, DexPoolSymbol::Type(descriptor))
+        }
+        DbpCodeSymbol::Field {
+            class, field, ty, ..
+        } => resolve_dex_pool_symbol(
+            dex,
+            DexPoolSymbol::Field {
+                class,
+                name: field,
+                ty,
+            },
+        ),
+        DbpCodeSymbol::Method {
+            class,
+            method,
+            proto,
+            ..
+        } => {
+            let (ret, params) = parse_method_descriptor(proto)
+                .ok_or_else(|| anyhow!("invalid descriptor `{proto}`"))?;
+            let param_refs: Vec<&str> = params.iter().map(String::as_str).collect();
+            resolve_dex_pool_symbol(
+                dex,
+                DexPoolSymbol::Method {
+                    class,
+                    name: method,
+                    ret: &ret,
+                    params: &param_refs,
+                },
+            )
+        }
+    }
+}
+
+fn materialize_code_template(
+    template: &DbpCodeTemplate,
+    symbols: &BTreeMap<String, u32>,
+) -> Result<Option<Vec<u8>>> {
+    let mut bytes = template.bytes.clone();
+    for slot in &template.slots {
+        let Some(&index) = symbols.get(&slot.name) else {
+            return Err(anyhow!("unresolved method-code symbol `{}`", slot.name));
+        };
+        match slot.width {
+            2 => {
+                let Ok(index) = u16::try_from(index) else {
+                    return Ok(None);
+                };
+                bytes[slot.offset..slot.offset + 2].copy_from_slice(&index.to_le_bytes());
+            }
+            4 => {
+                bytes[slot.offset..slot.offset + 4].copy_from_slice(&index.to_le_bytes());
+            }
+            width => return Err(anyhow!("unsupported method-code symbol width {width}")),
+        }
+    }
+    Ok(Some(bytes))
 }
 
 /// Every partition name referenced by the ops across `docs`.
@@ -766,7 +1056,7 @@ pub struct DbpFileResult {
 /// Apply every op targeting `partition_name` (across `docs`) inside
 /// `image_path`. Ops are grouped by file so each target is opened, patched, and
 /// written back once. Returns one result per declared target so callers can
-/// distinguish a missing image path from a present file whose firmware-pinned
+/// distinguish a missing image path from a present file whose size-preserving
 /// operations did not land.
 pub fn apply_partition_ops(
     image_path: &Path,
@@ -1055,22 +1345,32 @@ fn apply_one_op(dex: &mut [u8], op: &DbpOp) -> Result<bool> {
             class,
             method,
             proto,
+            symbols,
             replacements,
             ..
         } => {
             let (ret, params) = parse_method_descriptor(proto)
                 .ok_or_else(|| anyhow!("invalid descriptor `{proto}`"))?;
             let param_refs: Vec<&str> = params.iter().map(String::as_str).collect();
-            let decoded: Vec<(Vec<u8>, Vec<u8>, usize)> = replacements
-                .iter()
-                .map(|replacement| {
-                    Ok((
-                        parse_hex_bytes(&replacement.from).map_err(anyhow::Error::msg)?,
-                        parse_hex_bytes(&replacement.to).map_err(anyhow::Error::msg)?,
-                        replacement.expected,
-                    ))
-                })
-                .collect::<Result<_>>()?;
+            let mut resolved_symbols = BTreeMap::new();
+            for symbol in symbols {
+                let Some(index) = resolve_code_symbol(dex, symbol)? else {
+                    return Ok(false);
+                };
+                resolved_symbols.insert(symbol.name().to_string(), index);
+            }
+            let mut decoded = Vec::with_capacity(replacements.len());
+            for replacement in replacements {
+                let from = parse_code_template(&replacement.from).map_err(anyhow::Error::msg)?;
+                let to = parse_code_template(&replacement.to).map_err(anyhow::Error::msg)?;
+                let Some(from) = materialize_code_template(&from, &resolved_symbols)? else {
+                    return Ok(false);
+                };
+                let Some(to) = materialize_code_template(&to, &resolved_symbols)? else {
+                    return Ok(false);
+                };
+                decoded.push((from, to, replacement.expected));
+            }
             let code_replacements: Vec<MethodCodeReplacement<'_>> = decoded
                 .iter()
                 .map(|(from, to, expected)| MethodCodeReplacement {
@@ -2560,6 +2860,7 @@ value = false
                 DbpOp::MethodCodePatch {
                     partition,
                     file,
+                    symbols,
                     replacements,
                     ..
                 } => {
@@ -2570,6 +2871,7 @@ value = false
                         assert_eq!(partition, "system");
                         assert_eq!(file, "system/priv-app/ZuiLauncher/ZuiLauncher.apk");
                     }
+                    assert!(!symbols.is_empty(), "recents ops must resolve DEX symbols");
                     assert_eq!(replacements.len(), expected_replacements);
                 }
                 _ => panic!("recents fix op[{index}] must use method_code_patch"),
@@ -2611,83 +2913,96 @@ value = false
         assert_eq!(launcher_ops, 1);
     }
 
-    /// Apply the bundled Recents fix to the exact ZUXOS 1.5.10.183 SystemUI
-    /// APK. Set `DYNOBOX_ZUISYSTEMUI_APK`; optionally set
-    /// `DYNOBOX_ZUISYSTEMUI_DEX_OUT` to write the patched `classes2.dex`.
+    /// Apply the bundled Recents body-shape alternatives to real SystemUI APK
+    /// fixtures. Matching `*_DEX_OUT` variables optionally write the patched
+    /// `classes2.dex`.
     #[test]
     fn bundled_recents_fix_lands_on_real_apk() {
         use sha2::{Digest, Sha256};
 
-        let Ok(path) = std::env::var("DYNOBOX_ZUISYSTEMUI_APK") else {
-            return;
-        };
-        let apk = std::fs::read(path).expect("read ZuiSystemUI.apk");
-        assert_eq!(apk.len(), 221_867_547, "unexpected ZuiSystemUI.apk size");
-        let digest = Sha256::digest(&apk)
-            .iter()
-            .map(|byte| format!("{byte:02X}"))
-            .collect::<String>();
-        assert_eq!(
-            digest, "BD2C814D9D98BB4FC28055B0A376D04157F0623A5A4E44049596FE089A11BECC",
-            "unexpected ZuiSystemUI.apk digest"
-        );
-
         let doc = load_dbp(&patches_dir().join("fix-third-party-recents.dbp")).unwrap();
-        let zip = crate::fuck_lgsi::parse_zip_central_directory(&apk).expect("parse APK zip");
-        let mut landed = 0usize;
-        let mut op_hits = vec![0usize; doc.ops.len()];
-        let mut changed_entries = Vec::new();
-        for entry in zip.entries.iter().filter(|entry| {
-            entry.name.ends_with(".dex")
-                && entry.compression_method == 0
-                && !entry.uses_data_descriptor
-                && !entry.is_zip64
-                && entry.data_start + entry.compressed_size <= apk.len()
-        }) {
-            let original = &apk[entry.data_start..entry.data_start + entry.compressed_size];
-            let mut dex = original.to_vec();
-            let mut entry_hits = 0usize;
-            for (op_index, op) in doc.ops.iter().enumerate() {
-                if apply_one_op(&mut dex, op).unwrap() {
-                    landed += 1;
-                    entry_hits += 1;
-                    op_hits[op_index] += 1;
+
+        for (path_env, out_env, expected_len, expected_digest, expected_op_hits) in [
+            (
+                "DYNOBOX_ZUISYSTEMUI_APK",
+                "DYNOBOX_ZUISYSTEMUI_DEX_OUT",
+                221_867_547usize,
+                "BD2C814D9D98BB4FC28055B0A376D04157F0623A5A4E44049596FE089A11BECC",
+                [1usize, 1, 0],
+            ),
+            (
+                "DYNOBOX_ZUISYSTEMUI_ZUXOS294_APK",
+                "DYNOBOX_ZUISYSTEMUI_ZUXOS294_DEX_OUT",
+                221_892_123usize,
+                "1388CBBA8FB6B7B61BE393F0BFB88F9572EB58A5DDB27B7C0C3FCC06C80B7290",
+                [1usize, 1, 0],
+            ),
+        ] {
+            let Ok(path) = std::env::var(path_env) else {
+                continue;
+            };
+            let apk = std::fs::read(path).expect("read ZuiSystemUI.apk");
+            assert_eq!(apk.len(), expected_len, "unexpected ZuiSystemUI.apk size");
+            let digest = Sha256::digest(&apk)
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            assert_eq!(digest, expected_digest, "unexpected ZuiSystemUI.apk digest");
+
+            let zip = crate::fuck_lgsi::parse_zip_central_directory(&apk).expect("parse APK zip");
+            let mut landed = 0usize;
+            let mut op_hits = vec![0usize; doc.ops.len()];
+            let mut changed_entries = Vec::new();
+            for entry in zip.entries.iter().filter(|entry| {
+                entry.name.ends_with(".dex")
+                    && entry.compression_method == 0
+                    && !entry.uses_data_descriptor
+                    && !entry.is_zip64
+                    && entry.data_start + entry.compressed_size <= apk.len()
+            }) {
+                let original = &apk[entry.data_start..entry.data_start + entry.compressed_size];
+                let mut dex = original.to_vec();
+                let mut entry_hits = 0usize;
+                for (op_index, op) in doc.ops.iter().enumerate() {
+                    if apply_one_op(&mut dex, op).unwrap() {
+                        landed += 1;
+                        entry_hits += 1;
+                        op_hits[op_index] += 1;
+                    }
+                }
+                if entry_hits != 0 {
+                    assert_eq!(dex.len(), original.len(), "DEX size changed");
+                    assert_ne!(dex, original, "reported landing without a byte change");
+                    crate::fuck_lgsi::recompute_dex_header_sums(&mut dex);
+                    changed_entries.push(entry.name.clone());
+                    if let Ok(out) = std::env::var(out_env) {
+                        std::fs::write(out, &dex).expect("write patched classes2.dex");
+                    }
                 }
             }
-            if entry_hits != 0 {
-                assert_eq!(dex.len(), original.len(), "DEX size changed");
-                assert_ne!(dex, original, "reported landing without a byte change");
-                crate::fuck_lgsi::recompute_dex_header_sums(&mut dex);
-                changed_entries.push(entry.name.clone());
-                if let Ok(out) = std::env::var("DYNOBOX_ZUISYSTEMUI_DEX_OUT") {
-                    std::fs::write(out, &dex).expect("write patched classes2.dex");
-                }
-            }
+            assert_eq!(
+                landed, 2,
+                "both Recents method patches must land once; per-op hits: {op_hits:?}"
+            );
+            assert_eq!(op_hits, expected_op_hits, "unexpected structural op hits");
+            assert_eq!(changed_entries, ["classes2.dex"]);
         }
-        assert_eq!(
-            landed, 2,
-            "both Recents method patches must land once; per-op hits: {op_hits:?}"
-        );
-        assert_eq!(changed_entries, ["classes2.dex"]);
     }
 
-    /// Apply the bundled Launcher guard to the pinned ZUI 18.0.10.084 APK.
-    /// Set `DYNOBOX_ZUILAUNCHER_ZUI18_APK`; optionally set
-    /// `DYNOBOX_ZUILAUNCHER_ZUI18_DEX_OUT` to write patched `classes2.dex`.
-    /// If `DYNOBOX_ZUILAUNCHER_ZUXOS15_APK` is set, also prove that the same
-    /// raw operation safely skips the older TB322 launcher build.
+    /// Apply the bundled symbolic Launcher patch to all supported real APK
+    /// fixtures.
     #[test]
-    fn bundled_recents_launcher_guard_lands_on_zui18_and_skips_zuxos15() {
+    fn bundled_recents_launcher_guard_lands_on_supported_builds() {
         use sha2::{Digest, Sha256};
 
-        fn launcher_op(doc: &DbpDocument) -> &DbpOp {
+        fn launcher_ops(doc: &DbpDocument) -> Vec<&DbpOp> {
             doc.ops
                 .iter()
-                .find(|op| op.file() == "system/priv-app/ZuiLauncher/ZuiLauncher.apk")
-                .expect("ZuiLauncher method_code_patch op")
+                .filter(|op| op.file() == "system/priv-app/ZuiLauncher/ZuiLauncher.apk")
+                .collect()
         }
 
-        fn land_on_apk(apk: &[u8], op: &DbpOp, out: Option<&str>) -> (usize, Vec<String>) {
+        fn land_on_apk(apk: &[u8], ops: &[&DbpOp], out: Option<&str>) -> (usize, Vec<String>) {
             let zip = crate::fuck_lgsi::parse_zip_central_directory(apk).expect("parse APK zip");
             let mut landed = 0usize;
             let mut changed = Vec::new();
@@ -2700,8 +3015,14 @@ value = false
             }) {
                 let original = &apk[entry.data_start..entry.data_start + entry.compressed_size];
                 let mut dex = original.to_vec();
-                if apply_one_op(&mut dex, op).unwrap() {
-                    landed += 1;
+                let mut entry_landed = false;
+                for op in ops {
+                    if apply_one_op(&mut dex, op).unwrap() {
+                        landed += 1;
+                        entry_landed = true;
+                    }
+                }
+                if entry_landed {
                     assert_eq!(dex.len(), original.len(), "DEX size changed");
                     crate::fuck_lgsi::recompute_dex_header_sums(&mut dex);
                     changed.push(entry.name.clone());
@@ -2714,7 +3035,8 @@ value = false
         }
 
         let doc = load_dbp(&patches_dir().join("fix-third-party-recents.dbp")).unwrap();
-        let op = launcher_op(&doc);
+        let ops = launcher_ops(&doc);
+        assert_eq!(ops.len(), 1, "one pool-layout-independent Launcher op");
 
         if let Ok(path) = std::env::var("DYNOBOX_ZUILAUNCHER_ZUI18_APK") {
             let apk = std::fs::read(path).expect("read ZUI 18 ZuiLauncher.apk");
@@ -2728,8 +3050,25 @@ value = false
                 "unexpected ZUI 18 launcher digest"
             );
             let output = std::env::var("DYNOBOX_ZUILAUNCHER_ZUI18_DEX_OUT").ok();
-            let (landed, changed) = land_on_apk(&apk, op, output.as_deref());
+            let (landed, changed) = land_on_apk(&apk, &ops, output.as_deref());
             assert_eq!(landed, 1, "ZUI 18 launcher guard must land once");
+            assert_eq!(changed, ["classes2.dex"]);
+        }
+
+        if let Ok(path) = std::env::var("DYNOBOX_ZUILAUNCHER_ZUXOS294_APK") {
+            let apk = std::fs::read(path).expect("read ZUXOS 1.5.10.294 ZuiLauncher.apk");
+            assert_eq!(apk.len(), 47_480_434, "unexpected ZUXOS 294 launcher size");
+            let digest = Sha256::digest(&apk)
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            assert_eq!(
+                digest, "D2C28B0F939222FE56BD851AC63CE952705E79A3CBB87FB9C244192C6F4C7829",
+                "unexpected ZUXOS 294 launcher digest"
+            );
+            let output = std::env::var("DYNOBOX_ZUILAUNCHER_ZUXOS294_DEX_OUT").ok();
+            let (landed, changed) = land_on_apk(&apk, &ops, output.as_deref());
+            assert_eq!(landed, 1, "ZUXOS 294 launcher guard must land once");
             assert_eq!(changed, ["classes2.dex"]);
         }
 
@@ -2744,9 +3083,9 @@ value = false
                 digest, "09846E491C3978B1A9F8A83F11D60F58CE1100CD0B5B160311A497B1F60A06C1",
                 "unexpected ZUXOS launcher digest"
             );
-            let (landed, changed) = land_on_apk(&apk, op, None);
-            assert_eq!(landed, 0, "TB323-pinned launcher op should skip ZUXOS 1.5");
-            assert!(changed.is_empty());
+            let (landed, changed) = land_on_apk(&apk, &ops, None);
+            assert_eq!(landed, 1, "TB322 Launcher guard must land once");
+            assert_eq!(changed, ["classes2.dex"]);
         }
     }
 
@@ -3595,6 +3934,114 @@ method = "m"
 proto = "()V"
 [[op.replacement]]
 {replacement}
+"#
+            );
+            let f = write_temp_dbp(&body);
+            let err = load_dbp(f.path()).unwrap_err().to_string();
+            assert!(err.contains(expected_message), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn load_accepts_symbolic_method_code_patch_references() {
+        let f = write_temp_dbp(
+            r#"
+name = "t"
+[[op]]
+kind = "method_code_patch"
+partition = "system_ext"
+file = "priv-app/X/X.apk"
+class = "Lcom/x/Y;"
+method = "m"
+proto = "()V"
+
+[[op.symbol]]
+name = "is_empty"
+kind = "method"
+class = "Ljava/util/ArrayList;"
+method = "isEmpty"
+proto = "()Z"
+
+[[op.replacement]]
+from = "6e 10 ${is_empty:u16} 00 00 0a 00"
+to = "6e 10 ${is_empty:u16} 00 00 0a 01"
+"#,
+        );
+        let doc = load_dbp(f.path()).expect("symbolic method-code patch");
+        match &doc.ops[0] {
+            DbpOp::MethodCodePatch {
+                symbols,
+                replacements,
+                ..
+            } => {
+                assert_eq!(symbols.len(), 1);
+                assert_eq!(replacements.len(), 1);
+            }
+            _ => panic!("expected method_code_patch"),
+        }
+    }
+
+    #[test]
+    fn load_rejects_invalid_method_code_patch_symbols() {
+        for (symbols, from, to, expected_message) in [
+            (
+                r#"
+[[op.symbol]]
+name = "same"
+kind = "string"
+value = "first"
+[[op.symbol]]
+name = "same"
+kind = "string"
+value = "second"
+"#,
+                "1a 00 ${same:u16}",
+                "0e 00 00 00",
+                "duplicate symbol",
+            ),
+            (
+                "",
+                "1a 00 ${missing:u16}",
+                "0e 00 00 00",
+                "undefined symbol",
+            ),
+            (
+                r#"
+[[op.symbol]]
+name = "unused"
+kind = "string"
+value = "unused"
+"#,
+                "00 00",
+                "12 00",
+                "unused symbol",
+            ),
+            (
+                r#"
+[[op.symbol]]
+name = "text"
+kind = "string"
+value = "text"
+"#,
+                "1a 00 ${text:u32}",
+                "0e 00 00 00 00 00",
+                "does not accept u32",
+            ),
+        ] {
+            let body = format!(
+                r#"
+name = "t"
+[[op]]
+kind = "method_code_patch"
+partition = "system_ext"
+file = "priv-app/X/X.apk"
+class = "Lcom/x/Y;"
+method = "m"
+proto = "()V"
+{symbols}
+[[op.replacement]]
+from = "{from}"
+to = "{to}"
 "#
             );
             let f = write_temp_dbp(&body);

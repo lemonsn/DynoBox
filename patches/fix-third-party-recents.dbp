@@ -2,8 +2,8 @@ name = "fix-third-party-recents"
 description = "Fix SystemUI and ZuiLauncher Recents transitions with a third-party default launcher."
 
 # Mirror ZuiRecentsFix's GoingToOverview guard inside the OEM synthetic
-# Consumer. The first ordered replacement turns a removed debug-log block into
-# an animator-cancel code cave. Subsequent replacements route the
+# Consumer body shape whose removed entry log supplies an animator-cancel code
+# cave. Subsequent replacements route the
 # GoingToOverview branch through an ArrayList.isEmpty() guard: an empty list
 # records prevVisibleFreeforms + mLauncherState and returns, while a non-empty
 # list rejoins the byte-identical OEM hideAllTasks path. The final three
@@ -18,49 +18,184 @@ class = "Lcom/android/wm/shell/recents/RecentTasksController$$ExternalSyntheticL
 method = "accept"
 proto = "(Ljava/lang/Object;)V"
 
+[[op.symbol]]
+name = "string_builder_type"
+kind = "type"
+descriptor = "Ljava/lang/StringBuilder;"
+
+[[op.symbol]]
+name = "state_log"
+kind = "string"
+value = "OvHangingModeController#OvHangingModeController - state:"
+
+[[op.symbol]]
+name = "sb_init_string"
+kind = "method"
+class = "Ljava/lang/StringBuilder;"
+method = "<init>"
+proto = "(Ljava/lang/String;)V"
+
+[[op.symbol]]
+name = "sb_append_string"
+kind = "method"
+class = "Ljava/lang/StringBuilder;"
+method = "append"
+proto = "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
+
+[[op.symbol]]
+name = "sb_to_string"
+kind = "method"
+class = "Ljava/lang/StringBuilder;"
+method = "toString"
+proto = "()Ljava/lang/String;"
+
+[[op.symbol]]
+name = "hanging_tag"
+kind = "string"
+value = "OvHangingModeController"
+
+[[op.symbol]]
+name = "log_d"
+kind = "method"
+class = "Landroid/util/Log;"
+method = "d"
+proto = "(Ljava/lang/String;Ljava/lang/String;)I"
+
+[[op.symbol]]
+name = "hanging_positioner"
+kind = "field"
+class = "Lcom/android/wm/shell/desktopmode/OvHangingModeController;"
+field = "mHangingModePositioner"
+ty = "Lcom/android/wm/shell/desktopmode/OvHangingModePositioner;"
+
+[[op.symbol]]
+name = "positioner_animator"
+kind = "field"
+class = "Lcom/android/wm/shell/desktopmode/OvHangingModePositioner;"
+field = "mAnimator"
+ty = "Lcom/android/wm/shell/desktopmode/OvHangingModeAnimator;"
+
+[[op.symbol]]
+name = "animator_task_set"
+kind = "field"
+class = "Lcom/android/wm/shell/desktopmode/OvHangingModeAnimator;"
+field = "mTaskAnimSet"
+ty = "Lcom/android/wm/shell/desktopmode/OvHangingModeAnimator$TaskSetAnimator;"
+
+[[op.symbol]]
+name = "task_is_animating"
+kind = "field"
+class = "Lcom/android/wm/shell/desktopmode/OvHangingModeAnimator$TaskSetAnimator;"
+field = "isAnimating"
+ty = "Z"
+
+[[op.symbol]]
+name = "task_animator"
+kind = "field"
+class = "Lcom/android/wm/shell/desktopmode/OvHangingModeAnimator$TaskSetAnimator;"
+field = "animator"
+ty = "Landroid/animation/ValueAnimator;"
+
+[[op.symbol]]
+name = "cancel_animator"
+kind = "method"
+class = "Landroid/animation/ValueAnimator;"
+method = "cancel"
+proto = "()V"
+
+[[op.symbol]]
+name = "going_to_overview"
+kind = "string"
+value = "GoingToOverview"
+
+[[op.symbol]]
+name = "object_equals"
+kind = "method"
+class = "Ljava/lang/Object;"
+method = "equals"
+proto = "(Ljava/lang/Object;)Z"
+
+[[op.symbol]]
+name = "prev_visible_freeforms"
+kind = "field"
+class = "Lcom/android/wm/shell/desktopmode/OvHangingModeController;"
+field = "prevVisibleFreeforms"
+ty = "Ljava/util/List;"
+
+[[op.symbol]]
+name = "array_list_is_empty"
+kind = "method"
+class = "Ljava/util/ArrayList;"
+method = "isEmpty"
+proto = "()Z"
+
+[[op.symbol]]
+name = "launcher_state"
+kind = "field"
+class = "Lcom/android/wm/shell/desktopmode/OvHangingModeController;"
+field = "mLauncherState"
+ty = "Ljava/lang/String;"
+
+[[op.symbol]]
+name = "hide_all_tasks"
+kind = "method"
+class = "Lcom/android/wm/shell/desktopmode/OvfFreeformsHideAndRestore;"
+method = "hideAllTasks"
+proto = "(Ljava/util/List;ZILandroid/app/ActivityManager$RunningTaskInfo;)V"
+
+[[op.symbol]]
+name = "overview_log"
+kind = "string"
+value = "OvHangingModeController#onLauncherState - ? -> overview"
+
+[[op.symbol]]
+name = "home_log"
+kind = "string"
+value = "OvHangingModeController#onLauncherState - overview -> home"
+
 [[op.replacement]]
 from = """
-22 00 87 4f 1a 01 5d 80 70 20 a2 f9 10 00 6e 20 ab f9 50 00
-6e 10 af f9 00 00 0c 00 1a 01 5c 80 71 20 90 10 01 00
+22 00 ${string_builder_type:u16} 1a 01 ${state_log:u16} 70 20 ${sb_init_string:u16} 10 00 6e 20 ${sb_append_string:u16} 50 00
+6e 10 ${sb_to_string:u16} 00 00 0c 00 1a 01 ${hanging_tag:u16} 71 20 ${log_d:u16} 01 00
 """
 to = """
-29 00 13 00 54 64 9f c9 54 44 bc c9 54 44 95 c9 55 41 88 c9
-38 01 07 00 54 44 87 c9 6e 10 63 00 04 00 29 00 02 01
+29 00 13 00 54 64 ${hanging_positioner:u16} 54 44 ${positioner_animator:u16} 54 44 ${animator_task_set:u16} 55 41 ${task_is_animating:u16}
+38 01 07 00 54 44 ${task_animator:u16} 6e 10 ${cancel_animator:u16} 04 00 29 00 02 01
 """
 
 [[op.replacement]]
-from = "1a 00 d6 24 6e 20 52 f9 50 00 0a 00 38 00 20 00"
-to = "1a 00 d6 24 6e 20 52 f9 50 00 0a 01 38 01 20 00"
+from = "1a 00 ${going_to_overview:u16} 6e 20 ${object_equals:u16} 50 00 0a 00 38 00 20 00"
+to = "1a 00 ${going_to_overview:u16} 6e 20 ${object_equals:u16} 50 00 0a 01 38 01 20 00"
 
 [[op.replacement]]
-from = "0c 00 5b 60 a8 c9"
+from = "0c 00 5b 60 ${prev_visible_freeforms:u16}"
 to = "0c 04 29 00 ed ff"
 
 [[op.replacement]]
 from = """
-54 65 9f c9 54 55 bc c9 54 55 95 c9 55 50 88 c9 38 00 07 00
-54 55 87 c9 6e 10 63 00 05 00
+54 65 ${hanging_positioner:u16} 54 55 ${positioner_animator:u16} 54 55 ${animator_task_set:u16} 55 50 ${task_is_animating:u16} 38 00 07 00
+54 55 ${task_animator:u16} 6e 10 ${cancel_animator:u16} 05 00
 """
 to = """
-29 00 fe fe 5b 64 a8 c9 38 04 08 00 6e 10 4d fa 04 00 0a 01
-38 01 0d 00 5b 60 a1 c9 0e 00
+29 00 fe fe 5b 64 ${prev_visible_freeforms:u16} 38 04 08 00 6e 10 ${array_list_is_empty:u16} 04 00 0a 01
+38 01 0d 00 5b 60 ${launcher_state:u16} 0e 00
 """
 
 [[op.replacement]]
-from = "6e 51 92 e4 05 23"
-to = "6e 51 92 e4 45 23"
+from = "6e 51 ${hide_all_tasks:u16} 05 23"
+to = "6e 51 ${hide_all_tasks:u16} 45 23"
 
 [[op.replacement]]
-from = "1a 00 67 80 71 20 90 10 01 00"
-to = "1a 00 67 80 71 20 90 10 05 00"
+from = "1a 00 ${overview_log:u16} 71 20 ${log_d:u16} 01 00"
+to = "1a 00 ${overview_log:u16} 71 20 ${log_d:u16} 05 00"
 
 [[op.replacement]]
-from = "1a 00 68 80 71 20 90 10 01 00"
-to = "1a 00 68 80 71 20 90 10 05 00"
+from = "1a 00 ${home_log:u16} 71 20 ${log_d:u16} 01 00"
+to = "1a 00 ${home_log:u16} 71 20 ${log_d:u16} 05 00"
 
 [[op.replacement]]
-from = "6e 10 af f9 00 00 0c 00 71 20 90 10 01 00"
-to = "6e 10 af f9 00 00 0c 00 71 20 90 10 02 00"
+from = "6e 10 ${sb_to_string:u16} 00 00 0c 00 71 20 ${log_d:u16} 01 00"
+to = "6e 10 ${sb_to_string:u16} 00 00 0c 00 71 20 ${log_d:u16} 02 00"
 
 # Mirror the finishInner before-hook. The entry jumps into a second code cave
 # made from the removed OVF debug message. Only a "requested" finish whose
@@ -77,24 +212,169 @@ class = "Lcom/android/wm/shell/recents/RecentsTransitionHandler$RecentsControlle
 method = "finishInner"
 proto = "(ZZLcom/android/internal/os/IResultReceiver;Ljava/lang/String;)V"
 
+[[op.symbol]]
+name = "is_gesture"
+kind = "field"
+class = "Lcom/android/wm/shell/recents/RecentsTransitionHandler$RecentsController;"
+field = "mIsGesture"
+ty = "Z"
+
+[[op.symbol]]
+name = "string_builder_type"
+kind = "type"
+descriptor = "Ljava/lang/StringBuilder;"
+
+[[op.symbol]]
+name = "finish_log"
+kind = "string"
+value = "OVF-finishInner: toHome="
+
+[[op.symbol]]
+name = "sb_init_string"
+kind = "method"
+class = "Ljava/lang/StringBuilder;"
+method = "<init>"
+proto = "(Ljava/lang/String;)V"
+
+[[op.symbol]]
+name = "sb_append_bool"
+kind = "method"
+class = "Ljava/lang/StringBuilder;"
+method = "append"
+proto = "(Z)Ljava/lang/StringBuilder;"
+
+[[op.symbol]]
+name = "to_overview_log"
+kind = "string"
+value = ", toOverView="
+
+[[op.symbol]]
+name = "sb_append_string"
+kind = "method"
+class = "Ljava/lang/StringBuilder;"
+method = "append"
+proto = "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
+
+[[op.symbol]]
+name = "window_progress_log"
+kind = "string"
+value = ", windowProgress=0.0, lastWindowProgress="
+
+[[op.symbol]]
+name = "last_window_progress"
+kind = "field"
+class = "Lcom/android/wm/shell/recents/OvFreeformRecentsGestureHelper;"
+field = "mLastWindowProgressToRecents"
+ty = "F"
+
+[[op.symbol]]
+name = "sb_append_float"
+kind = "method"
+class = "Ljava/lang/StringBuilder;"
+method = "append"
+proto = "(F)Ljava/lang/StringBuilder;"
+
+[[op.symbol]]
+name = "long_swipe_log"
+kind = "string"
+value = ", mLongSwipeFullToFreeform="
+
+[[op.symbol]]
+name = "long_swipe_full_to_freeform"
+kind = "field"
+class = "Lcom/android/wm/shell/recents/OvFreeformRecentsGestureHelper;"
+field = "mLongSwipeFullToFreeform"
+ty = "Z"
+
+[[op.symbol]]
+name = "switch_task_log"
+kind = "string"
+value = ", mIsSwitchNewTaskIsFreeform="
+
+[[op.symbol]]
+name = "is_switch_new_task_freeform"
+kind = "field"
+class = "Lcom/android/wm/shell/recents/OvFreeformRecentsGestureHelper;"
+field = "mIsSwitchNewTaskIsFreeform"
+ty = "Z"
+
+[[op.symbol]]
+name = "sb_to_string"
+kind = "method"
+class = "Ljava/lang/StringBuilder;"
+method = "toString"
+proto = "()Ljava/lang/String;"
+
+[[op.symbol]]
+name = "gesture_helper_tag"
+kind = "string"
+value = "OvFreeformRecentsGestureHelper"
+
+[[op.symbol]]
+name = "slog_d"
+kind = "method"
+class = "Landroid/util/Slog;"
+method = "d"
+proto = "(Ljava/lang/String;Ljava/lang/String;)I"
+
+[[op.symbol]]
+name = "requested"
+kind = "string"
+value = "requested"
+
+[[op.symbol]]
+name = "object_equals"
+kind = "method"
+class = "Ljava/lang/Object;"
+method = "equals"
+proto = "(Ljava/lang/Object;)Z"
+
+[[op.symbol]]
+name = "will_finish_to_home"
+kind = "field"
+class = "Lcom/android/wm/shell/recents/RecentsTransitionHandler$RecentsController;"
+field = "mWillFinishToHome"
+ty = "Z"
+
+[[op.symbol]]
+name = "state"
+kind = "field"
+class = "Lcom/android/wm/shell/recents/RecentsTransitionHandler$RecentsController;"
+field = "mState"
+ty = "I"
+
+[[op.symbol]]
+name = "pausing_tasks"
+kind = "field"
+class = "Lcom/android/wm/shell/recents/RecentsTransitionHandler$RecentsController;"
+field = "mPausingTasks"
+ty = "Ljava/util/ArrayList;"
+
+[[op.symbol]]
+name = "array_list_is_empty"
+kind = "method"
+class = "Ljava/util/ArrayList;"
+method = "isEmpty"
+proto = "()Z"
+
 [[op.replacement]]
-from = "55 13 65 d3"
+from = "55 13 ${is_gesture:u16}"
 to = "29 00 17 00"
 
 [[op.replacement]]
 from = """
-22 07 87 4f 1a 08 b9 7f 70 20 a2 f9 87 00 6e 20 ac f9 07 00
-1a 08 c6 14 6e 20 ab f9 87 00 6e 20 ac f9 67 00 1a 08 54 15
-6e 20 ab f9 87 00 52 38 ed d2 6e 20 a6 f9 87 00 1a 08 1e 12
-6e 20 ab f9 87 00 55 38 ee d2 6e 20 ac f9 87 00 1a 08 19 12
-6e 20 ab f9 87 00 55 38 ec d2 6e 20 ac f9 87 00 6e 10 af f9
-07 00 0c 07 1a 08 4b 80 71 20 11 11 78 00
+22 07 ${string_builder_type:u16} 1a 08 ${finish_log:u16} 70 20 ${sb_init_string:u16} 87 00 6e 20 ${sb_append_bool:u16} 07 00
+1a 08 ${to_overview_log:u16} 6e 20 ${sb_append_string:u16} 87 00 6e 20 ${sb_append_bool:u16} 67 00 1a 08 ${window_progress_log:u16}
+6e 20 ${sb_append_string:u16} 87 00 52 38 ${last_window_progress:u16} 6e 20 ${sb_append_float:u16} 87 00 1a 08 ${long_swipe_log:u16}
+6e 20 ${sb_append_string:u16} 87 00 55 38 ${long_swipe_full_to_freeform:u16} 6e 20 ${sb_append_bool:u16} 87 00 1a 08 ${switch_task_log:u16}
+6e 20 ${sb_append_string:u16} 87 00 55 38 ${is_switch_new_task_freeform:u16} 6e 20 ${sb_append_bool:u16} 87 00 6e 10 ${sb_to_string:u16}
+07 00 0c 07 1a 08 ${gesture_helper_tag:u16} 71 20 ${slog_d:u16} 78 00
 """
 to = """
-29 00 39 00 08 06 1b 00 1b 03 3a 0d 01 00 6e 20 52 f9 63 00
-0a 03 38 03 17 00 38 00 15 00 55 13 78 d3 39 03 11 00 52 13
-75 d3 39 03 0d 00 54 13 6c d3 38 03 09 00 6e 10 4d fa 03 00
-0a 03 39 03 03 00 12 00 55 13 65 d3 29 00 c9 ff
+29 00 39 00 08 06 1b 00 1b 03 ${requested:u32} 6e 20 ${object_equals:u16} 63 00
+0a 03 38 03 17 00 38 00 15 00 55 13 ${will_finish_to_home:u16} 39 03 11 00 52 13
+${state:u16} 39 03 0d 00 54 13 ${pausing_tasks:u16} 38 03 09 00 6e 10 ${array_list_is_empty:u16} 03 00
+0a 03 39 03 03 00 12 00 55 13 ${is_gesture:u16} 29 00 c9 ff
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 """
@@ -110,6 +390,7 @@ to = """
 # RemoteTransition setup, but that animation wrapper cannot coexist with the
 # guard inside this fixed 52-code-unit body. Functional Home navigation remains;
 # only the OEM remote animation is omitted on this fallback path.
+# Symbolic DEX references keep the body portable when pool layouts move.
 [[op]]
 kind = "method_code_patch"
 partition = "system"
@@ -119,21 +400,163 @@ class = "Lcom/android/quickstep/RecentsActivity;"
 method = "M"
 proto = "()V"
 
+[[op.symbol]]
+name = "launcher_animation_runner_type"
+kind = "type"
+descriptor = "Lcom/android/launcher3/LauncherAnimationRunner;"
+
+[[op.symbol]]
+name = "get_main_thread_handler"
+kind = "method"
+class = "Landroid/app/Activity;"
+method = "getMainThreadHandler"
+proto = "()Landroid/os/Handler;"
+
+[[op.symbol]]
+name = "remote_animation_factory"
+kind = "field"
+class = "Lcom/android/quickstep/RecentsActivity;"
+field = "D"
+ty = "Lcom/android/launcher3/LauncherAnimationRunner$RemoteAnimationFactory;"
+
+[[op.symbol]]
+name = "launcher_animation_runner_init"
+kind = "method"
+class = "Lcom/android/launcher3/LauncherAnimationRunner;"
+method = "<init>"
+proto = "(Landroid/os/Handler;Lcom/android/launcher3/LauncherAnimationRunner$RemoteAnimationFactory;Z)V"
+
+[[op.symbol]]
+name = "remote_animation_adapter_type"
+kind = "type"
+descriptor = "Landroid/view/RemoteAnimationAdapter;"
+
+[[op.symbol]]
+name = "remote_animation_adapter_init"
+kind = "method"
+class = "Landroid/view/RemoteAnimationAdapter;"
+method = "<init>"
+proto = "(Landroid/view/IRemoteAnimationRunner;JJ)V"
+
+[[op.symbol]]
+name = "remote_transition_type"
+kind = "type"
+descriptor = "Landroid/window/RemoteTransition;"
+
+[[op.symbol]]
+name = "to_remote_transition"
+kind = "method"
+class = "Lcom/android/systemui/animation/RemoteAnimationRunnerCompat;"
+method = "toRemoteTransition"
+proto = "()Landroid/window/IRemoteTransition;"
+
+[[op.symbol]]
+name = "get_application_thread"
+kind = "method"
+class = "Landroid/app/Activity;"
+method = "getIApplicationThread"
+proto = "()Landroid/app/IApplicationThread;"
+
+[[op.symbol]]
+name = "start_home_name"
+kind = "string"
+value = "StartHomeFromRecents"
+
+[[op.symbol]]
+name = "remote_transition_init"
+kind = "method"
+class = "Landroid/window/RemoteTransition;"
+method = "<init>"
+proto = "(Landroid/window/IRemoteTransition;Landroid/app/IApplicationThread;Ljava/lang/String;)V"
+
+[[op.symbol]]
+name = "make_remote_animation"
+kind = "method"
+class = "Landroid/app/ActivityOptions;"
+method = "makeRemoteAnimation"
+proto = "(Landroid/view/RemoteAnimationAdapter;Landroid/window/RemoteTransition;)Landroid/app/ActivityOptions;"
+
+[[op.symbol]]
+name = "activity_options_to_bundle"
+kind = "method"
+class = "Landroid/app/ActivityOptions;"
+method = "toBundle"
+proto = "()Landroid/os/Bundle;"
+
+[[op.symbol]]
+name = "recents_activity_name"
+kind = "string"
+value = "RecentsActivity"
+
+[[op.symbol]]
+name = "start_home_safely"
+kind = "method"
+class = "Lcom/android/quickstep/OverviewComponentObserver;"
+method = "startHomeIntentSafely"
+proto = "(Landroid/content/Context;Landroid/os/Bundle;Ljava/lang/String;)V"
+
+[[op.symbol]]
+name = "activity_manager_wrapper_instance"
+kind = "method"
+class = "Lcom/android/systemui/shared/system/ActivityManagerWrapper;"
+method = "getInstance"
+proto = "()Lcom/android/systemui/shared/system/ActivityManagerWrapper;"
+
+[[op.symbol]]
+name = "get_running_task"
+kind = "method"
+class = "Lcom/android/systemui/shared/system/ActivityManagerWrapper;"
+method = "getRunningTask"
+proto = "()Landroid/app/ActivityManager$RunningTaskInfo;"
+
+[[op.symbol]]
+name = "is_home_task"
+kind = "method"
+class = "Lcom/android/systemui/shared/system/ActivityManagerWrapper;"
+method = "isHomeTask"
+proto = "(Landroid/app/ActivityManager$RunningTaskInfo;)Z"
+
+[[op.symbol]]
+name = "top_activity"
+kind = "field"
+class = "Landroid/app/ActivityManager$RunningTaskInfo;"
+field = "topActivity"
+ty = "Landroid/content/ComponentName;"
+
+[[op.symbol]]
+name = "get_package_name"
+kind = "method"
+class = "Landroid/content/ComponentName;"
+method = "getPackageName"
+proto = "()Ljava/lang/String;"
+
+[[op.symbol]]
+name = "launcher_package"
+kind = "string"
+value = "com.zui.launcher"
+
+[[op.symbol]]
+name = "string_equals"
+kind = "method"
+class = "Ljava/lang/String;"
+method = "equals"
+proto = "(Ljava/lang/Object;)Z"
+
 [[op.replacement]]
 from = """
-22 06 95 05 6e 10 dc 00 08 00 0c 00 54 81 11 1f 12 12
-70 40 f1 17 06 21 22 07 58 02 16 02 fa 00 16 04 00 00
-07 70 07 61 76 06 39 0a 00 00 22 00 1a 03 6e 10 b2 7c
-06 00 0c 01 6e 10 d7 00 08 00 0c 02 1a 03 a3 59 70 40
-9b 10 10 32 71 20 2d 01 07 00 0c 00 6e 10 4a 01 00 00
-0c 00 1a 01 d3 54 71 30 4e 4e 08 01 0e 00
+22 06 ${launcher_animation_runner_type:u16} 6e 10 ${get_main_thread_handler:u16} 08 00 0c 00 54 81 ${remote_animation_factory:u16} 12 12
+70 40 ${launcher_animation_runner_init:u16} 06 21 22 07 ${remote_animation_adapter_type:u16} 16 02 fa 00 16 04 00 00
+07 70 07 61 76 06 ${remote_animation_adapter_init:u16} 00 00 22 00 ${remote_transition_type:u16} 6e 10 ${to_remote_transition:u16}
+06 00 0c 01 6e 10 ${get_application_thread:u16} 08 00 0c 02 1a 03 ${start_home_name:u16} 70 40
+${remote_transition_init:u16} 10 32 71 20 ${make_remote_animation:u16} 07 00 0c 00 6e 10 ${activity_options_to_bundle:u16} 00 00
+0c 00 1a 01 ${recents_activity_name:u16} 71 30 ${start_home_safely:u16} 08 01 0e 00
 """
 to = """
-71 00 28 8d 00 00 0c 00 6e 10 2d 8d 00 00 0c 00
-38 00 19 00 71 10 36 8d 00 00 0a 01 39 01 13 00
-54 01 62 00 38 01 0f 00 6e 10 18 03 01 00 0c 01
-1a 02 9c 72 6e 20 14 f2 12 00 0a 01 39 01 03 00
-0e 00 12 00 1a 01 d3 54 71 30 4e 4e 08 01 0e 00
+71 00 ${activity_manager_wrapper_instance:u16} 00 00 0c 00 6e 10 ${get_running_task:u16} 00 00 0c 00
+38 00 19 00 71 10 ${is_home_task:u16} 00 00 0a 01 39 01 13 00
+54 01 ${top_activity:u16} 38 01 0f 00 6e 10 ${get_package_name:u16} 01 00 0c 01
+1a 02 ${launcher_package:u16} 6e 20 ${string_equals:u16} 12 00 0a 01 39 01 03 00
+0e 00 12 00 1a 01 ${recents_activity_name:u16} 71 30 ${start_home_safely:u16} 08 01 0e 00
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 00 00 00 00 00 00
 """
