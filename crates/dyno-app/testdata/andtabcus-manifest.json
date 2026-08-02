@@ -1,0 +1,14 @@
+{
+  "schema": "dynobox.output_manifest",
+  "version": 1,
+  "generator": "andtabcus-test-fixture",
+  "generated_at": "2026-08-02T00:00:00Z",
+  "semantic_verification": true,
+  "artifacts": [
+    {
+      "path": "boot.img",
+      "size": 4,
+      "sha256": "4509beb0ab401d71fa4a5cd94a55c9a74f13332776ae4019c5bfc4c2005157ff"
+    }
+  ]
+}

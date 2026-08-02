@@ -375,6 +375,11 @@ enum Commands {
         /// Repeat to trust multiple signers.
         #[arg(long, value_name = "PUBLIC_KEY_PEM")]
         trusted_integrity_key: Vec<PathBuf>,
+
+        /// Accept a trusted signed manifest's semantic-verification attestation.
+        /// Artifact SHA-256 verification is always performed locally.
+        #[arg(long)]
+        trust_manifest_attestation: bool,
     },
     /// Generate a dedicated Ed25519 manifest-signing keypair
     IntegrityKeygen {
@@ -1033,6 +1038,7 @@ where
             format,
             output,
             trusted_integrity_key,
+            trust_manifest_attestation,
         } => {
             if cli.progress_format == ProgressFormat::Text {
                 info!("verify: {}", input.display());
@@ -1042,6 +1048,7 @@ where
                 &input,
                 &VerificationOptions {
                     trusted_integrity_keys: trusted_integrity_key,
+                    trust_manifest_attestation,
                 },
             )?;
             let rendered = match format {
@@ -1117,12 +1124,14 @@ mod tests {
             "one.pub.pem",
             "--trusted-integrity-key",
             "two.pub.pem",
+            "--trust-manifest-attestation",
         ])
         .unwrap();
         assert!(matches!(
             verify.command,
             Commands::Verify {
                 trusted_integrity_key,
+                trust_manifest_attestation: true,
                 ..
             } if trusted_integrity_key.len() == 2
         ));

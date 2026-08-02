@@ -31,7 +31,7 @@ pub const MANIFEST_SCHEMA: &str = "dynobox.output_manifest";
 pub const MANIFEST_VERSION: u32 = 1;
 
 /// Streaming hash buffer sized for multi-GB firmware artifacts.
-const HASH_BUFFER_SIZE: usize = 1024 * 1024;
+const HASH_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 /// Root document stored in [`MANIFEST_FILE_NAME`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,8 +48,18 @@ pub struct OutputManifest {
     /// the root `abl.elf` from their artifact inventory by policy.
     #[serde(default, skip_serializing_if = "is_false")]
     pub resign_performed: bool,
+    /// Immutable inventory of `.img` files from the original request input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_artifacts: Vec<ManifestArtifact>,
     /// Sorted recursive regular-file inventory.
     pub artifacts: Vec<ManifestArtifact>,
+}
+
+#[derive(Debug)]
+struct ArtifactCandidate {
+    path: String,
+    full_path: PathBuf,
+    discovered_size: u64,
 }
 
 /// Policy captured in a generated output manifest.
@@ -64,7 +74,7 @@ pub struct OutputManifestOptions {
 /// One inventoried regular file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestArtifact {
-    /// Path relative to the output root using `/` separators.
+    /// Path relative to the corresponding inventory root using `/` separators.
     pub path: String,
     pub size: u64,
     /// Lowercase hex SHA-256 of the file bytes.
@@ -144,6 +154,17 @@ pub fn build_output_manifest_with_options(
     generated_at: impl Into<String>,
     options: OutputManifestOptions,
 ) -> Result<OutputManifest> {
+    build_output_manifest_with_input_artifacts(output_dir, generated_at, options, &[])
+}
+
+/// Scan `output_dir` and attach an immutable original-input image inventory.
+pub fn build_output_manifest_with_input_artifacts(
+    output_dir: &Path,
+    generated_at: impl Into<String>,
+    options: OutputManifestOptions,
+    input_artifacts: &[ManifestArtifact],
+) -> Result<OutputManifest> {
+    validate_artifact_array(input_artifacts, "input artifact")?;
     let artifacts = collect_artifacts(output_dir, options.resign_performed)?;
     Ok(OutputManifest {
         schema: MANIFEST_SCHEMA.to_string(),
@@ -152,6 +173,7 @@ pub fn build_output_manifest_with_options(
         generated_at: generated_at.into(),
         semantic_verification: options.semantic_verification,
         resign_performed: options.resign_performed,
+        input_artifacts: input_artifacts.to_vec(),
         artifacts,
     })
 }
@@ -183,7 +205,22 @@ pub fn write_output_manifest_for_dir_with_options(
     generated_at: impl Into<String>,
     options: OutputManifestOptions,
 ) -> Result<OutputManifest> {
-    let manifest = build_output_manifest_with_options(output_dir, generated_at, options)?;
+    write_output_manifest_for_dir_with_input_artifacts(output_dir, generated_at, options, &[])
+}
+
+/// Build and write a manifest with an immutable original-input image inventory.
+pub fn write_output_manifest_for_dir_with_input_artifacts(
+    output_dir: &Path,
+    generated_at: impl Into<String>,
+    options: OutputManifestOptions,
+    input_artifacts: &[ManifestArtifact],
+) -> Result<OutputManifest> {
+    let manifest = build_output_manifest_with_input_artifacts(
+        output_dir,
+        generated_at,
+        options,
+        input_artifacts,
+    )?;
     write_output_manifest(output_dir, &manifest)?;
     Ok(manifest)
 }
@@ -193,7 +230,7 @@ pub fn read_output_manifest(output_dir: &Path) -> Result<OutputManifest> {
     let path = output_dir.join(MANIFEST_FILE_NAME);
     let bytes = fs::read(&path)
         .with_context(|| format!("Failed to read output manifest from {}", path.display()))?;
-    parse_manifest_bytes(&bytes)
+    parse_output_manifest_bytes(&bytes)
         .with_context(|| format!("Failed to parse output manifest at {}", path.display()))
 }
 
@@ -204,19 +241,16 @@ pub fn read_output_manifest(output_dir: &Path) -> Result<OutputManifest> {
 /// as `Err`.
 pub fn verify_output_manifest(output_dir: &Path) -> Result<ManifestVerificationReport> {
     let manifest_path = output_dir.join(MANIFEST_FILE_NAME);
-    let mut issues = Vec::new();
 
     match fs::symlink_metadata(&manifest_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
-            issues.push(ManifestIssue::Malformed {
-                message: format!(
-                    "manifest must be a regular file, not a symlink or special file: {}",
-                    manifest_path.display()
-                ),
-            });
+            let message = format!(
+                "manifest must be a regular file, not a symlink or special file: {}",
+                manifest_path.display()
+            );
             return Ok(ManifestVerificationReport {
                 manifest_path,
-                issues,
+                issues: vec![ManifestIssue::Malformed { message }],
             });
         }
         Ok(_) => {}
@@ -231,43 +265,48 @@ pub fn verify_output_manifest(output_dir: &Path) -> Result<ManifestVerificationR
         }
     }
 
-    let manifest = match fs::read(&manifest_path) {
-        Ok(bytes) => match parse_manifest_bytes(&bytes) {
-            Ok(manifest) => manifest,
-            Err(err) => {
-                issues.push(ManifestIssue::Malformed {
-                    message: err.to_string(),
-                });
-                return Ok(ManifestVerificationReport {
-                    manifest_path,
-                    issues,
-                });
-            }
-        },
+    match fs::read(&manifest_path) {
+        Ok(bytes) => verify_output_manifest_bytes(output_dir, &bytes),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            issues.push(ManifestIssue::Malformed {
-                message: format!("manifest not found: {}", manifest_path.display()),
-            });
+            let message = format!("manifest not found: {}", manifest_path.display());
+            Ok(ManifestVerificationReport {
+                manifest_path,
+                issues: vec![ManifestIssue::Malformed { message }],
+            })
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to read output manifest from {}",
+                manifest_path.display()
+            )
+        }),
+    }
+}
+
+/// Verify `output_dir` against the exact already-loaded manifest bytes.
+pub fn verify_output_manifest_bytes(
+    output_dir: &Path,
+    manifest_bytes: &[u8],
+) -> Result<ManifestVerificationReport> {
+    let manifest_path = output_dir.join(MANIFEST_FILE_NAME);
+    let manifest = match parse_output_manifest_bytes(manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(err) => {
             return Ok(ManifestVerificationReport {
                 manifest_path,
-                issues,
-            });
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "Failed to read output manifest from {}",
-                    manifest_path.display()
-                )
+                issues: vec![ManifestIssue::Malformed {
+                    message: err.to_string(),
+                }],
             });
         }
     };
+    let candidates = discover_artifact_candidates(output_dir, manifest.resign_performed)?;
 
-    // `parse_manifest_bytes` already rejects duplicate / unsorted / CI-colliding
-    // artifact arrays, so BTreeMap keying here is safe for verification.
-    let actual = collect_artifacts(output_dir, manifest.resign_performed)?
+    // Parsing rejects duplicate, unsorted, and case-colliding paths, so maps
+    // cannot discard distinct validated entries here.
+    let actual = candidates
         .into_iter()
-        .map(|artifact| (artifact.path.clone(), artifact))
+        .map(|candidate| (candidate.path.clone(), candidate))
         .collect::<BTreeMap<_, _>>();
     let expected = manifest
         .artifacts
@@ -275,32 +314,54 @@ pub fn verify_output_manifest(output_dir: &Path) -> Result<ManifestVerificationR
         .map(|artifact| (artifact.path.clone(), artifact))
         .collect::<BTreeMap<_, _>>();
 
-    for (path, expected_artifact) in &expected {
-        match actual.get(path) {
+    let mut hash_candidates = Vec::new();
+    let mut issues = Vec::new();
+    for (path, expected_artifact) in expected {
+        match actual.get(&path) {
             None => issues.push(ManifestIssue::Missing { path: path.clone() }),
-            Some(actual_artifact) => {
-                if actual_artifact.size != expected_artifact.size {
+            Some(candidate) => {
+                if candidate.discovered_size != expected_artifact.size {
                     issues.push(ManifestIssue::SizeMismatch {
                         path: path.clone(),
                         expected: expected_artifact.size,
-                        actual: actual_artifact.size,
+                        actual: candidate.discovered_size,
                     });
-                } else if actual_artifact.sha256 != expected_artifact.sha256 {
-                    issues.push(ManifestIssue::DigestMismatch {
-                        path: path.clone(),
-                        expected: expected_artifact.sha256.clone(),
-                        actual: actual_artifact.sha256.clone(),
-                    });
+                } else {
+                    hash_candidates.push((candidate, expected_artifact));
                 }
             }
         }
     }
 
     for path in actual.keys() {
-        if !expected.contains_key(path) {
+        if !manifest
+            .artifacts
+            .iter()
+            .any(|artifact| &artifact.path == path)
+        {
             issues.push(ManifestIssue::Unexpected { path: path.clone() });
         }
     }
+
+    let candidates_to_hash = hash_candidates
+        .iter()
+        .map(|(candidate, _)| ArtifactCandidate {
+            path: candidate.path.clone(),
+            full_path: candidate.full_path.clone(),
+            discovered_size: candidate.discovered_size,
+        })
+        .collect::<Vec<_>>();
+    let hashed = hash_candidates_bounded(&candidates_to_hash)?;
+    for (artifact, (_, expected_artifact)) in hashed.into_iter().zip(hash_candidates) {
+        if artifact.sha256 != expected_artifact.sha256 {
+            issues.push(ManifestIssue::DigestMismatch {
+                path: artifact.path,
+                expected: expected_artifact.sha256.clone(),
+                actual: artifact.sha256,
+            });
+        }
+    }
+    sort_manifest_issues(&mut issues);
 
     Ok(ManifestVerificationReport {
         manifest_path,
@@ -318,7 +379,7 @@ pub fn serialize_manifest(manifest: &OutputManifest) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn parse_manifest_bytes(bytes: &[u8]) -> Result<OutputManifest> {
+pub fn parse_output_manifest_bytes(bytes: &[u8]) -> Result<OutputManifest> {
     let manifest: OutputManifest =
         serde_json::from_slice(bytes).map_err(|err| anyhow!("malformed manifest JSON: {err}"))?;
     if manifest.schema != MANIFEST_SCHEMA {
@@ -336,32 +397,40 @@ fn parse_manifest_bytes(bytes: &[u8]) -> Result<OutputManifest> {
         );
     }
 
-    let mut previous: Option<&str> = None;
-    let mut seen_ci: HashMap<String, String> = HashMap::new();
+    validate_artifact_array(&manifest.input_artifacts, "input artifact")?;
+    validate_artifact_array(&manifest.artifacts, "artifact")?;
     for artifact in &manifest.artifacts {
-        validate_relative_slash_path(&artifact.path)?;
         if manifest.resign_performed && artifact.path == RESIGN_EXCLUDED_ROOT_ARTIFACT {
             bail!(
                 "resign manifest must not inventory excluded root artifact '{}'",
                 RESIGN_EXCLUDED_ROOT_ARTIFACT
             );
         }
+    }
+
+    Ok(manifest)
+}
+
+fn validate_artifact_array(artifacts: &[ManifestArtifact], label: &str) -> Result<()> {
+    let mut previous: Option<&str> = None;
+    let mut seen_ci: HashMap<String, String> = HashMap::new();
+    for artifact in artifacts {
+        validate_relative_slash_path(&artifact.path)?;
         if !is_lowercase_hex_sha256(&artifact.sha256) {
             bail!(
-                "artifact '{}' has invalid sha256 digest '{}'",
+                "{label} '{}' has invalid sha256 digest '{}'",
                 artifact.path,
                 artifact.sha256
             );
         }
-
         if let Some(prev) = previous {
             match artifact.path.as_str().cmp(prev) {
                 std::cmp::Ordering::Equal => {
-                    bail!("duplicate artifact path '{}'", artifact.path);
+                    bail!("duplicate {label} path '{}'", artifact.path);
                 }
                 std::cmp::Ordering::Less => {
                     bail!(
-                        "artifact paths are not sorted: '{}' appears after '{}'",
+                        "{label} paths are not sorted: '{}' appears after '{}'",
                         artifact.path,
                         prev
                     );
@@ -374,18 +443,25 @@ fn parse_manifest_bytes(bytes: &[u8]) -> Result<OutputManifest> {
         let ci_key = artifact.path.to_lowercase();
         if let Some(existing) = seen_ci.get(&ci_key) {
             bail!(
-                "case-insensitive artifact path collision: '{}' and '{}'",
+                "case-insensitive {label} path collision: '{}' and '{}'",
                 existing,
                 artifact.path
             );
         }
         seen_ci.insert(ci_key, artifact.path.clone());
     }
-
-    Ok(manifest)
+    Ok(())
 }
 
 fn collect_artifacts(output_dir: &Path, resign_performed: bool) -> Result<Vec<ManifestArtifact>> {
+    let candidates = discover_artifact_candidates(output_dir, resign_performed)?;
+    hash_candidates_bounded(&candidates)
+}
+
+fn discover_artifact_candidates(
+    output_dir: &Path,
+    resign_performed: bool,
+) -> Result<Vec<ArtifactCandidate>> {
     if !output_dir.is_dir() {
         bail!(
             "output directory does not exist or is not a directory: {}",
@@ -393,27 +469,27 @@ fn collect_artifacts(output_dir: &Path, resign_performed: bool) -> Result<Vec<Ma
         );
     }
 
-    let mut artifacts = Vec::new();
+    let mut candidates = Vec::new();
     // Lowercase path -> first-seen original path, for case-insensitive collisions.
     let mut seen_ci: HashMap<String, String> = HashMap::new();
-    walk_collect(
+    walk_discover_output(
         output_dir,
         output_dir,
         true,
         resign_performed,
-        &mut artifacts,
+        &mut candidates,
         &mut seen_ci,
     )?;
-    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(artifacts)
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(candidates)
 }
 
-fn walk_collect(
+fn walk_discover_output(
     root: &Path,
     dir: &Path,
     is_root: bool,
     resign_performed: bool,
-    artifacts: &mut Vec<ManifestArtifact>,
+    candidates: &mut Vec<ArtifactCandidate>,
     seen_ci: &mut HashMap<String, String>,
 ) -> Result<()> {
     let mut entries = fs::read_dir(dir)
@@ -454,7 +530,7 @@ fn walk_collect(
             continue;
         }
         if file_type.is_dir() {
-            walk_collect(root, &path, false, resign_performed, artifacts, seen_ci)?;
+            walk_discover_output(root, &path, false, resign_performed, candidates, seen_ci)?;
             continue;
         }
         if !file_type.is_file() {
@@ -477,17 +553,120 @@ fn walk_collect(
             bail!("duplicate path in output tree: '{relative}'");
         }
         seen_ci.insert(ci_key, relative.clone());
-
-        let (size, sha256) = sha256_file(&path)
-            .with_context(|| format!("Failed to hash artifact {}", path.display()))?;
-        artifacts.push(ManifestArtifact {
+        candidates.push(ArtifactCandidate {
             path: relative,
-            size,
-            sha256,
+            full_path: path,
+            discovered_size: metadata.len(),
         });
     }
 
     Ok(())
+}
+
+/// Recursively inventory regular `.img` files from the original request input.
+///
+/// Directory inputs use normalized relative paths; a regular file input uses
+/// its basename. Symlinks and special files are rejected rather than followed.
+pub fn collect_input_image_artifacts(input: &Path) -> Result<Vec<ManifestArtifact>> {
+    let metadata = fs::symlink_metadata(input)
+        .with_context(|| format!("Failed to inspect original input {}", input.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        bail!("refusing to inventory symlink input: {}", input.display());
+    }
+
+    let mut candidates = Vec::new();
+    let mut seen_ci = HashMap::new();
+    if file_type.is_dir() {
+        walk_discover_input_images(input, input, &mut candidates, &mut seen_ci)?;
+    } else if file_type.is_file() {
+        if is_img_path(input) {
+            let name = input
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("non-UTF8 original input file name: {}", input.display()))?;
+            validate_path_component(name)?;
+            candidates.push(ArtifactCandidate {
+                path: name.to_string(),
+                full_path: input.to_path_buf(),
+                discovered_size: metadata.len(),
+            });
+        }
+    } else {
+        bail!(
+            "refusing to inventory special-file input: {}",
+            input.display()
+        );
+    }
+
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    hash_candidates_bounded(&candidates)
+}
+
+fn walk_discover_input_images(
+    root: &Path,
+    dir: &Path,
+    candidates: &mut Vec<ArtifactCandidate>,
+    seen_ci: &mut HashMap<String, String>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(dir)
+        .with_context(|| format!("Failed to read original input directory {}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("Failed to list original input directory {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF8 file name under {}", dir.display()))?;
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Failed to stat original input {}", path.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            bail!(
+                "refusing to inventory symlink in original input: {}",
+                path.display()
+            );
+        }
+        if file_type.is_dir() {
+            walk_discover_input_images(root, &path, candidates, seen_ci)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            bail!(
+                "refusing to inventory special file in original input: {}",
+                path.display()
+            );
+        }
+        if !is_img_path(&path) {
+            continue;
+        }
+
+        let relative = relative_slash_path(root, &path)?;
+        let ci_key = relative.to_lowercase();
+        if let Some(existing) = seen_ci.get(&ci_key) {
+            bail!(
+                "case-insensitive input image path collision: '{}' and '{}'",
+                existing,
+                relative
+            );
+        }
+        seen_ci.insert(ci_key, relative.clone());
+        candidates.push(ArtifactCandidate {
+            path: relative,
+            full_path: path,
+            discovered_size: metadata.len(),
+        });
+    }
+    Ok(())
+}
+
+fn is_img_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("img"))
 }
 
 /// Root-only exclusions: the live manifest/signature files and the exact atomic
@@ -594,17 +773,76 @@ fn is_windows_drive_like(component: &str) -> bool {
     )
 }
 
-fn sha256_file(path: &Path) -> Result<(u64, String)> {
-    let pre_meta = fs::metadata(path)
+fn hash_candidates_bounded(candidates: &[ArtifactCandidate]) -> Result<Vec<ManifestArtifact>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(2)
+        .min(candidates.len());
+
+    let mut indexed = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for worker in 0..worker_count {
+            handles.push(scope.spawn(move || {
+                let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
+                (worker..candidates.len())
+                    .step_by(worker_count)
+                    .map(|index| {
+                        (
+                            index,
+                            hash_candidate(&candidates[index], &mut buffer).with_context(|| {
+                                format!(
+                                    "Failed to hash artifact {}",
+                                    candidates[index].full_path.display()
+                                )
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        let mut results = Vec::with_capacity(candidates.len());
+        for handle in handles {
+            results.extend(
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("artifact hashing worker panicked"))?,
+            );
+        }
+        Ok::<_, anyhow::Error>(results)
+    })?;
+    indexed.sort_by_key(|(index, _)| *index);
+    indexed.into_iter().map(|(_, artifact)| artifact).collect()
+}
+
+fn hash_candidate(candidate: &ArtifactCandidate, buffer: &mut [u8]) -> Result<ManifestArtifact> {
+    let path = &candidate.full_path;
+    let pre_meta = fs::symlink_metadata(path)
         .with_context(|| format!("Failed to read metadata before hashing {}", path.display()))?;
+    if pre_meta.file_type().is_symlink() || !pre_meta.file_type().is_file() {
+        bail!(
+            "artifact became a symlink or special file before hashing: {}",
+            path.display()
+        );
+    }
     let pre_size = pre_meta.len();
+    if pre_size != candidate.discovered_size {
+        bail!(
+            "file size changed after discovery {}: discovered={}, pre={pre_size}",
+            path.display(),
+            candidate.discovered_size
+        );
+    }
 
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; HASH_BUFFER_SIZE];
     let mut size = 0u64;
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = file.read(buffer)?;
         if read == 0 {
             break;
         }
@@ -614,8 +852,14 @@ fn sha256_file(path: &Path) -> Result<(u64, String)> {
             .ok_or_else(|| anyhow!("file size overflow while hashing {}", path.display()))?;
     }
 
-    let post_meta = fs::metadata(path)
+    let post_meta = fs::symlink_metadata(path)
         .with_context(|| format!("Failed to read metadata after hashing {}", path.display()))?;
+    if post_meta.file_type().is_symlink() || !post_meta.file_type().is_file() {
+        bail!(
+            "artifact became a symlink or special file while hashing: {}",
+            path.display()
+        );
+    }
     let post_size = post_meta.len();
     if pre_size != size || post_size != size {
         bail!(
@@ -624,7 +868,25 @@ fn sha256_file(path: &Path) -> Result<(u64, String)> {
         );
     }
 
-    Ok((size, hex_encode(hasher.finalize().as_slice())))
+    Ok(ManifestArtifact {
+        path: candidate.path.clone(),
+        size,
+        sha256: hex_encode(hasher.finalize().as_slice()),
+    })
+}
+
+fn sort_manifest_issues(issues: &mut [ManifestIssue]) {
+    issues.sort_by(|left, right| issue_sort_key(left).cmp(&issue_sort_key(right)));
+}
+
+fn issue_sort_key(issue: &ManifestIssue) -> (&str, u8) {
+    match issue {
+        ManifestIssue::Missing { path } => (path, 0),
+        ManifestIssue::Unexpected { path } => (path, 1),
+        ManifestIssue::SizeMismatch { path, .. } => (path, 2),
+        ManifestIssue::DigestMismatch { path, .. } => (path, 3),
+        ManifestIssue::Malformed { message } => (message, 4),
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -743,6 +1005,127 @@ mod tests {
         assert_eq!(bytes_a, bytes_b);
         assert!(bytes_a.ends_with(b"\n"));
         assert!(!bytes_a.ends_with(b"\n\n"));
+    }
+
+    #[test]
+    fn old_v1_manifest_without_input_artifacts_parses_as_empty() {
+        let json = handcrafted_manifest_json("[]");
+        let manifest = parse_output_manifest_bytes(json.as_bytes()).unwrap();
+        assert!(manifest.input_artifacts.is_empty());
+        assert_eq!(manifest.version, 1);
+    }
+
+    #[test]
+    fn input_artifacts_are_serialized_deterministically_and_validated_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("output.bin"), b"output");
+        let inputs = vec![
+            ManifestArtifact {
+                path: "boot.img".to_string(),
+                size: 4,
+                sha256: known_digest(b"boot"),
+            },
+            ManifestArtifact {
+                path: "nested/system.img".to_string(),
+                size: 6,
+                sha256: known_digest(b"system"),
+            },
+        ];
+        let manifest = build_output_manifest_with_input_artifacts(
+            dir.path(),
+            "2026-07-18T00:00:00Z",
+            OutputManifestOptions {
+                semantic_verification: true,
+                resign_performed: false,
+            },
+            &inputs,
+        )
+        .unwrap();
+        assert_eq!(manifest.input_artifacts, inputs);
+        assert_eq!(
+            serialize_manifest(&manifest).unwrap(),
+            serialize_manifest(&manifest).unwrap()
+        );
+
+        let mut invalid_inputs = inputs;
+        invalid_inputs.swap(0, 1);
+        let error = build_output_manifest_with_input_artifacts(
+            dir.path(),
+            "2026-07-18T00:00:00Z",
+            OutputManifestOptions::default(),
+            &invalid_inputs,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("input artifact paths are not sorted"));
+    }
+
+    #[test]
+    fn collects_only_recursive_input_images_with_normalized_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("boot.img"), b"boot");
+        write_file(&dir.path().join("nested").join("System.IMG"), b"system");
+        write_file(&dir.path().join("nested").join("vendor.bin"), b"vendor");
+        write_file(&dir.path().join("notes.img.tmp"), b"ignore");
+
+        let artifacts = collect_input_image_artifacts(dir.path()).unwrap();
+        assert_eq!(
+            artifacts
+                .iter()
+                .map(|artifact| artifact.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["boot.img", "nested/System.IMG"]
+        );
+        assert_eq!(artifacts[0].sha256, known_digest(b"boot"));
+        assert_eq!(artifacts[1].sha256, known_digest(b"system"));
+
+        let single = collect_input_image_artifacts(&dir.path().join("boot.img")).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].path, "boot.img");
+    }
+
+    #[test]
+    fn input_image_collision_is_rejected_when_filesystem_allows_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("Boot.img");
+        let lower = dir.path().join("boot.img");
+        write_file(&upper, b"one");
+        if File::create_new(&lower).is_err() {
+            return;
+        }
+        write_file(&lower, b"two");
+        if fs::read_dir(dir.path()).unwrap().count() < 2 {
+            return;
+        }
+
+        let error = collect_input_image_artifacts(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("case-insensitive input image path collision"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_image_collector_rejects_symlinks_and_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("target.img"), b"target");
+        std::os::unix::fs::symlink(dir.path().join("target.img"), dir.path().join("linked.img"))
+            .unwrap();
+        assert!(
+            collect_input_image_artifacts(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+        );
+
+        fs::remove_file(dir.path().join("linked.img")).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.path().join("socket")).unwrap();
+        assert!(
+            collect_input_image_artifacts(dir.path())
+                .unwrap_err()
+                .to_string()
+                .contains("special file")
+        );
     }
 
     #[test]
@@ -949,6 +1332,78 @@ mod tests {
     }
 
     #[test]
+    fn supplied_manifest_bytes_are_verified_without_a_second_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("blob.bin"), b"blob");
+        write_output_manifest_for_dir(dir.path(), "2026-07-18T04:30:00Z", true).unwrap();
+        let bytes = fs::read(dir.path().join(MANIFEST_FILE_NAME)).unwrap();
+        write_file(
+            &dir.path().join(MANIFEST_FILE_NAME),
+            b"{ replaced on disk }",
+        );
+
+        let report = verify_output_manifest_bytes(dir.path(), &bytes).unwrap();
+        assert!(report.is_ok(), "{:?}", report.issues);
+        assert!(!verify_output_manifest(dir.path()).unwrap().is_ok());
+    }
+
+    #[test]
+    fn verification_issues_are_path_sorted_with_parallel_digest_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("a-unexpected.bin"), b"unexpected");
+        write_file(&dir.path().join("b-size.bin"), b"wrong-size");
+        write_file(&dir.path().join("c-digest.bin"), b"bad!");
+
+        let manifest = OutputManifest {
+            schema: MANIFEST_SCHEMA.to_string(),
+            version: MANIFEST_VERSION,
+            generator: "test".to_string(),
+            generated_at: "2026-07-18T04:45:00Z".to_string(),
+            semantic_verification: true,
+            resign_performed: false,
+            input_artifacts: Vec::new(),
+            artifacts: vec![
+                ManifestArtifact {
+                    path: "b-size.bin".to_string(),
+                    size: 1,
+                    sha256: known_digest(b"x"),
+                },
+                ManifestArtifact {
+                    path: "c-digest.bin".to_string(),
+                    size: 4,
+                    sha256: known_digest(b"good"),
+                },
+                ManifestArtifact {
+                    path: "d-missing.bin".to_string(),
+                    size: 7,
+                    sha256: known_digest(b"missing"),
+                },
+            ],
+        };
+        let bytes = serialize_manifest(&manifest).unwrap();
+
+        let first = verify_output_manifest_bytes(dir.path(), &bytes).unwrap();
+        let second = verify_output_manifest_bytes(dir.path(), &bytes).unwrap();
+        assert_eq!(first.issues, second.issues);
+        assert!(matches!(
+            &first.issues[0],
+            ManifestIssue::Unexpected { path } if path == "a-unexpected.bin"
+        ));
+        assert!(matches!(
+            &first.issues[1],
+            ManifestIssue::SizeMismatch { path, .. } if path == "b-size.bin"
+        ));
+        assert!(matches!(
+            &first.issues[2],
+            ManifestIssue::DigestMismatch { path, .. } if path == "c-digest.bin"
+        ));
+        assert!(matches!(
+            &first.issues[3],
+            ManifestIssue::Missing { path } if path == "d-missing.bin"
+        ));
+    }
+
+    #[test]
     fn excludes_only_root_manifest_signature_and_atomic_temps() {
         let dir = tempfile::tempdir().unwrap();
         write_file(&dir.path().join("data.bin"), b"data");
@@ -1019,7 +1474,7 @@ mod tests {
     {{ "path": "a.bin", "size": 1, "sha256": "{digest_a}" }}
   ]"#
         ));
-        let err = parse_manifest_bytes(duplicate.as_bytes())
+        let err = parse_output_manifest_bytes(duplicate.as_bytes())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1033,7 +1488,7 @@ mod tests {
     {{ "path": "a.bin", "size": 1, "sha256": "{digest_b}" }}
   ]"#
         ));
-        let err = parse_manifest_bytes(unsorted.as_bytes())
+        let err = parse_output_manifest_bytes(unsorted.as_bytes())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1047,7 +1502,7 @@ mod tests {
     {{ "path": "artifact.bin", "size": 1, "sha256": "{digest_b}" }}
   ]"#
         ));
-        let err = parse_manifest_bytes(case_collision.as_bytes())
+        let err = parse_output_manifest_bytes(case_collision.as_bytes())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1060,7 +1515,7 @@ mod tests {
     {{ "path": "C:/boot.img", "size": 1, "sha256": "{digest_a}" }}
   ]"#
         ));
-        let err = parse_manifest_bytes(drive_path.as_bytes())
+        let err = parse_output_manifest_bytes(drive_path.as_bytes())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1074,7 +1529,7 @@ mod tests {
     {{ "path": "z.bin", "size": 1, "sha256": "{digest_b}" }}
   ]"#
         ));
-        let ok = parse_manifest_bytes(sorted_ok.as_bytes()).unwrap();
+        let ok = parse_output_manifest_bytes(sorted_ok.as_bytes()).unwrap();
         assert_eq!(ok.artifacts.len(), 2);
     }
 

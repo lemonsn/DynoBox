@@ -2,8 +2,9 @@
 //!
 //! The signature envelope embeds the public key so any verifier can establish
 //! that the manifest and signature are internally consistent. Authenticity is
-//! a separate decision: the embedded key is trusted only when it matches a
-//! caller-supplied, externally pinned Ed25519 public key.
+//! a separate decision: the embedded key is trusted when it matches either the
+//! built-in andtabcus release identity or a caller-supplied, externally pinned
+//! Ed25519 public key.
 
 use std::fs;
 use std::io::Write;
@@ -21,6 +22,12 @@ use crate::integrity::{MANIFEST_FILE_NAME, MANIFEST_SIGNATURE_FILE_NAME};
 pub const SIGNATURE_SCHEMA: &str = "dynobox.output_manifest_signature";
 pub const SIGNATURE_VERSION: u32 = 1;
 pub const SIGNATURE_ALGORITHM: &str = "ed25519";
+/// Raw Ed25519 public key for the built-in andtabcus release identity.
+pub const ANDTABCUS_PUBLIC_KEY_HEX: &str =
+    "e8cd58c2f56804446cd88163a5315a6740eecc1fb8ccf0fd1dddda802ce2016b";
+/// SHA-256 key ID for [`ANDTABCUS_PUBLIC_KEY_HEX`].
+pub const ANDTABCUS_KEY_ID: &str =
+    "eadf6f26f5d20f992c3c915aa312cb7c0f9a133c2306617d8b8ff59b0450c116";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestSignatureEnvelope {
@@ -44,11 +51,20 @@ pub enum SignatureTrustStatus {
     Invalid,
 }
 
+/// A signer identity whose public key is pinned in DynoBox itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedSignerIdentity {
+    Andtabcus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManifestSignatureVerification {
     pub signature_path: PathBuf,
     pub status: SignatureTrustStatus,
     pub key_id: Option<String>,
+    /// Present only when the verified public key matches a built-in identity.
+    pub identity: Option<TrustedSignerIdentity>,
     pub issue: Option<String>,
 }
 
@@ -144,14 +160,50 @@ pub fn verify_output_manifest_signature(
     trusted_public_keys: &[PathBuf],
 ) -> Result<ManifestSignatureVerification> {
     let signature_path = output_dir.join(MANIFEST_SIGNATURE_FILE_NAME);
+    if let Some(verification) = inspect_signature_path(&signature_path)? {
+        return Ok(verification);
+    }
+
+    let manifest_path = output_dir.join(MANIFEST_FILE_NAME);
+    let manifest_bytes = fs::read(&manifest_path)
+        .with_context(|| format!("failed to read manifest at {}", manifest_path.display()))?;
+    Ok(verify_existing_signature(
+        &signature_path,
+        &manifest_bytes,
+        trusted_public_keys,
+    ))
+}
+
+/// Verify a detached signature against the exact manifest bytes supplied by
+/// the caller. This avoids observing a different manifest snapshot after the
+/// caller has parsed or verified its artifact inventory.
+pub fn verify_output_manifest_signature_bytes(
+    output_dir: &Path,
+    manifest_bytes: &[u8],
+    trusted_public_keys: &[PathBuf],
+) -> Result<ManifestSignatureVerification> {
+    let signature_path = output_dir.join(MANIFEST_SIGNATURE_FILE_NAME);
+    if let Some(verification) = inspect_signature_path(&signature_path)? {
+        return Ok(verification);
+    }
+
+    Ok(verify_existing_signature(
+        &signature_path,
+        manifest_bytes,
+        trusted_public_keys,
+    ))
+}
+
+fn inspect_signature_path(signature_path: &Path) -> Result<Option<ManifestSignatureVerification>> {
     match fs::symlink_metadata(&signature_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ManifestSignatureVerification {
-                signature_path,
+            return Ok(Some(ManifestSignatureVerification {
+                signature_path: signature_path.to_path_buf(),
                 status: SignatureTrustStatus::Unsigned,
                 key_id: None,
+                identity: None,
                 issue: None,
-            });
+            }));
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -162,38 +214,48 @@ pub fn verify_output_manifest_signature(
             });
         }
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
-            return Ok(ManifestSignatureVerification {
-                signature_path: signature_path.clone(),
+            return Ok(Some(ManifestSignatureVerification {
+                signature_path: signature_path.to_path_buf(),
                 status: SignatureTrustStatus::Invalid,
                 key_id: None,
+                identity: None,
                 issue: Some(format!(
                     "manifest signature must be a regular file: {}",
                     signature_path.display()
                 )),
-            });
+            }));
         }
         Ok(_) => {}
     }
 
-    let verification = match verify_signature_inner(output_dir, trusted_public_keys) {
-        Ok((key_id, trusted)) => ManifestSignatureVerification {
-            signature_path,
+    Ok(None)
+}
+
+fn verify_existing_signature(
+    signature_path: &Path,
+    manifest_bytes: &[u8],
+    trusted_public_keys: &[PathBuf],
+) -> ManifestSignatureVerification {
+    match verify_signature_inner(signature_path, manifest_bytes, trusted_public_keys) {
+        Ok((key_id, trusted, identity)) => ManifestSignatureVerification {
+            signature_path: signature_path.to_path_buf(),
             status: if trusted {
                 SignatureTrustStatus::ValidTrusted
             } else {
                 SignatureTrustStatus::ValidUntrusted
             },
             key_id: Some(key_id),
+            identity,
             issue: None,
         },
         Err(error) => ManifestSignatureVerification {
-            signature_path,
+            signature_path: signature_path.to_path_buf(),
             status: SignatureTrustStatus::Invalid,
             key_id: None,
+            identity: None,
             issue: Some(error.to_string()),
         },
-    };
-    Ok(verification)
+    }
 }
 
 pub fn serialize_signature_envelope(envelope: &ManifestSignatureEnvelope) -> Result<Vec<u8>> {
@@ -205,13 +267,10 @@ pub fn serialize_signature_envelope(envelope: &ManifestSignatureEnvelope) -> Res
 }
 
 fn verify_signature_inner(
-    output_dir: &Path,
+    signature_path: &Path,
+    manifest_bytes: &[u8],
     trusted_public_keys: &[PathBuf],
-) -> Result<(String, bool)> {
-    let manifest_path = output_dir.join(MANIFEST_FILE_NAME);
-    let signature_path = output_dir.join(MANIFEST_SIGNATURE_FILE_NAME);
-    let manifest_bytes = fs::read(&manifest_path)
-        .with_context(|| format!("failed to read manifest at {}", manifest_path.display()))?;
+) -> Result<(String, bool, Option<TrustedSignerIdentity>)> {
     let envelope_bytes = fs::read(&signature_path).with_context(|| {
         format!(
             "failed to read manifest signature at {}",
@@ -237,16 +296,23 @@ fn verify_signature_inner(
     let signature_bytes = decode_hex_array::<64>(&envelope.signature, "signature")?;
     let signature = Signature::from_bytes(&signature_bytes);
     verifying_key
-        .verify_strict(&manifest_bytes, &signature)
+        .verify_strict(manifest_bytes, &signature)
         .context("Ed25519 manifest signature verification failed")?;
 
-    let trusted = trusted_public_keys
+    let identity = (envelope.public_key == ANDTABCUS_PUBLIC_KEY_HEX
+        && actual_key_id == ANDTABCUS_KEY_ID)
+        .then_some(TrustedSignerIdentity::Andtabcus);
+    let externally_trusted = trusted_public_keys
         .iter()
         .map(|path| load_public_key(path))
         .collect::<Result<Vec<_>>>()?
         .iter()
         .any(|trusted_key| trusted_key == &verifying_key);
-    Ok((actual_key_id, trusted))
+    Ok((
+        actual_key_id,
+        identity.is_some() || externally_trusted,
+        identity,
+    ))
 }
 
 fn load_public_key(path: &Path) -> Result<VerifyingKey> {
@@ -429,6 +495,7 @@ mod tests {
         let untrusted = verify_output_manifest_signature(output.path(), &[]).unwrap();
         assert_eq!(untrusted.status, SignatureTrustStatus::ValidUntrusted);
         assert_eq!(untrusted.key_id.as_deref(), Some(key_id.as_str()));
+        assert_eq!(untrusted.identity, None);
 
         let wrong = verify_output_manifest_signature(output.path(), &[wrong_public]).unwrap();
         assert_eq!(wrong.status, SignatureTrustStatus::ValidUntrusted);
@@ -436,6 +503,65 @@ mod tests {
         let trusted = verify_output_manifest_signature(output.path(), &[public]).unwrap();
         assert_eq!(trusted.status, SignatureTrustStatus::ValidTrusted);
         assert!(trusted.is_trusted());
+        assert_eq!(trusted.identity, None);
+    }
+
+    #[test]
+    fn supplied_manifest_bytes_are_the_only_bytes_verified() {
+        let output = make_output();
+        let key_dir = tempfile::tempdir().unwrap();
+        let (private, _) = make_keys(key_dir.path(), "snapshot");
+        sign_output_manifest(output.path(), &private).unwrap();
+        let signed_bytes = fs::read(output.path().join(MANIFEST_FILE_NAME)).unwrap();
+        fs::write(output.path().join(MANIFEST_FILE_NAME), b"{}\n").unwrap();
+
+        let exact =
+            verify_output_manifest_signature_bytes(output.path(), &signed_bytes, &[]).unwrap();
+        assert_eq!(exact.status, SignatureTrustStatus::ValidUntrusted);
+
+        let reread = verify_output_manifest_signature(output.path(), &[]).unwrap();
+        assert_eq!(reread.status, SignatureTrustStatus::Invalid);
+    }
+
+    #[test]
+    fn pinned_andtabcus_fixture_is_trusted_and_identified() {
+        let output = tempfile::tempdir().unwrap();
+        let manifest = include_bytes!("../testdata/andtabcus-manifest.json");
+        fs::write(
+            output.path().join(MANIFEST_SIGNATURE_FILE_NAME),
+            include_bytes!("../testdata/andtabcus-manifest.sig"),
+        )
+        .unwrap();
+
+        let verification =
+            verify_output_manifest_signature_bytes(output.path(), manifest, &[]).unwrap();
+        assert_eq!(verification.status, SignatureTrustStatus::ValidTrusted);
+        assert_eq!(verification.key_id.as_deref(), Some(ANDTABCUS_KEY_ID));
+        assert_eq!(
+            verification.identity,
+            Some(TrustedSignerIdentity::Andtabcus)
+        );
+    }
+
+    #[test]
+    fn pinned_key_id_without_the_pinned_key_has_no_identity() {
+        let output = make_output();
+        let key_dir = tempfile::tempdir().unwrap();
+        let (private, _) = make_keys(key_dir.path(), "unknown");
+        sign_output_manifest(output.path(), &private).unwrap();
+        let signature_path = output.path().join(MANIFEST_SIGNATURE_FILE_NAME);
+        let mut envelope: ManifestSignatureEnvelope =
+            serde_json::from_slice(&fs::read(&signature_path).unwrap()).unwrap();
+        envelope.key_id = ANDTABCUS_KEY_ID.to_string();
+        fs::write(
+            &signature_path,
+            serialize_signature_envelope(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let verification = verify_output_manifest_signature(output.path(), &[]).unwrap();
+        assert_eq!(verification.status, SignatureTrustStatus::Invalid);
+        assert_eq!(verification.identity, None);
     }
 
     #[test]
@@ -472,6 +598,7 @@ mod tests {
         fs::write(&path, serialize_signature_envelope(&envelope).unwrap()).unwrap();
         let tampered = verify_output_manifest_signature(output.path(), &[]).unwrap();
         assert_eq!(tampered.status, SignatureTrustStatus::Invalid);
+        assert_eq!(tampered.identity, None);
     }
 
     #[test]

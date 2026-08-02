@@ -87,6 +87,21 @@ dynobox integrity-keygen   Generate a manifest-signing keypair
 Use `dynobox <command> --help` for every option, including `--boot-spl`,
 `--vendor-spl`, `--system-spl`, `--fuck-lgsi`, `--debloat`, and `--plus`.
 
+### Output provenance and trusted verification
+
+Output manifests record full-file SHA-256 digests for generated artifacts and
+for the original input images, preserving the provenance of a pipeline result.
+DynoBox also recognizes manifests signed by its built-in **andtabcus** release
+identity; other valid signatures remain untrusted unless their public key is
+supplied with `--trusted-integrity-key`.
+
+`dynobox verify --trust-manifest-attestation` can skip the redundant local
+AVB/XML/`super` semantic pass when a trusted, valid signature covers a manifest
+that records successful semantic verification. This is an explicit performance
+tradeoff: use it only when you intend to trust that signer. DynoBox still hashes
+every current output artifact in full and never accepts the attestation if the
+manifest, signature, or artifact inventory is malformed or tampered with.
+
 ---
 
 ## License

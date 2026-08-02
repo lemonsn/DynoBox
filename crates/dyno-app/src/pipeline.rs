@@ -291,6 +291,7 @@ trait PipelineOps {
         &self,
         output_dir: &Path,
         resign_performed: bool,
+        input_artifacts: &[crate::integrity::ManifestArtifact],
         integrity_key: Option<&Path>,
         events: &mut dyn EventSink,
     ) -> anyhow::Result<()>;
@@ -387,6 +388,7 @@ impl PipelineOps for RealPipelineOps {
         &self,
         output_dir: &Path,
         resign_performed: bool,
+        input_artifacts: &[crate::integrity::ManifestArtifact],
         integrity_key: Option<&Path>,
         events: &mut dyn EventSink,
     ) -> anyhow::Result<()> {
@@ -395,13 +397,14 @@ impl PipelineOps for RealPipelineOps {
             MessageLevel::Info,
             "Hashing final output for dynobox-manifest.json...".to_string(),
         );
-        let manifest = crate::integrity::write_output_manifest_for_dir_with_options(
+        let manifest = crate::integrity::write_output_manifest_for_dir_with_input_artifacts(
             output_dir,
             crate::report::now_iso8601(),
             crate::integrity::OutputManifestOptions {
                 semantic_verification: true,
                 resign_performed,
             },
+            input_artifacts,
         )?;
         if resign_performed
             && output_dir
@@ -419,7 +422,8 @@ impl PipelineOps for RealPipelineOps {
             events,
             MessageLevel::Info,
             format!(
-                "Wrote dynobox-manifest.json with {} SHA-256 artifact digest(s).",
+                "Wrote dynobox-manifest.json with {} original input image digest(s) and {} output artifact digest(s).",
+                manifest.input_artifacts.len(),
                 manifest.artifacts.len()
             ),
         );
@@ -439,6 +443,7 @@ fn verify_and_finalize_output<O>(
     ops: &O,
     output_dir: &Path,
     resign_performed: bool,
+    input_artifacts: &[crate::integrity::ManifestArtifact],
     integrity_key: Option<&Path>,
     events: &mut dyn EventSink,
 ) -> anyhow::Result<()>
@@ -447,7 +452,29 @@ where
 {
     ops.verify_stage(output_dir, events)?;
     ops.finalize_report(output_dir)?;
-    ops.seal_output(output_dir, resign_performed, integrity_key, events)
+    ops.seal_output(
+        output_dir,
+        resign_performed,
+        input_artifacts,
+        integrity_key,
+        events,
+    )
+}
+
+fn capture_original_input_artifacts(
+    input: &Path,
+    events: &mut dyn EventSink,
+) -> anyhow::Result<Vec<crate::integrity::ManifestArtifact>> {
+    let artifacts = crate::integrity::collect_input_image_artifacts(input)?;
+    message(
+        events,
+        MessageLevel::Info,
+        format!(
+            "Captured {} SHA-256 digest(s) from original input image(s).",
+            artifacts.len()
+        ),
+    );
+    Ok(artifacts)
 }
 
 fn run_unpack_with_ops<S, O>(request: &UnpackRequest, events: &mut S, ops: &O) -> anyhow::Result<()>
@@ -467,6 +494,7 @@ where
         input: request.input.clone(),
         output: request.output.clone(),
     });
+    let input_artifacts = capture_original_input_artifacts(&request.input, events)?;
 
     let temp_root = create_pipeline_temp_root(&request.output)?;
     let decrypted_input = auto_decrypt_xml_if_needed(&request.input, temp_root.path(), events)?;
@@ -478,6 +506,7 @@ where
             ops,
             &request.output,
             request.resign.is_some(),
+            &input_artifacts,
             request.integrity_key.as_deref(),
             events,
         );
@@ -536,6 +565,7 @@ where
         ops,
         &request.output,
         request.resign.is_some(),
+        &input_artifacts,
         request.integrity_key.as_deref(),
         events,
     )
@@ -559,6 +589,7 @@ where
         input: request.input.clone(),
         output: request.output.clone(),
     });
+    let input_artifacts = capture_original_input_artifacts(&request.input, events)?;
 
     let temp_root = create_pipeline_temp_root(&request.output)?;
     ops.apply_preflight(&request.ota_zips, temp_root.path(), events)?;
@@ -618,6 +649,7 @@ where
         ops,
         &request.output,
         request.resign.is_some(),
+        &input_artifacts,
         request.integrity_key.as_deref(),
         events,
     )
@@ -640,6 +672,7 @@ where
         input: request.input.clone(),
         output: request.output.clone(),
     });
+    let input_artifacts = capture_original_input_artifacts(&request.input, events)?;
 
     let temp_root = create_pipeline_temp_root(&request.output)?;
     let decrypted_input = auto_decrypt_xml_if_needed(&request.input, temp_root.path(), events)?;
@@ -653,6 +686,7 @@ where
             ops,
             &request.output,
             true,
+            &input_artifacts,
             request.integrity_key.as_deref(),
             events,
         );
@@ -672,6 +706,7 @@ where
         ops,
         &request.output,
         true,
+        &input_artifacts,
         request.integrity_key.as_deref(),
         events,
     )
@@ -764,6 +799,7 @@ where
         input: request.input.clone(),
         output: request.output.clone(),
     });
+    let input_artifacts = capture_original_input_artifacts(&request.input, events)?;
 
     let temp_root = create_pipeline_temp_root(&request.output)?;
     let decrypted_input = auto_decrypt_xml_if_needed(&request.input, temp_root.path(), events)?;
@@ -776,6 +812,7 @@ where
         ops,
         &request.output,
         false,
+        &input_artifacts,
         request.integrity_key.as_deref(),
         events,
     )
@@ -4524,6 +4561,8 @@ mod tests {
         repack_base_inputs: RefCell<Vec<PathBuf>>,
         repack_base_has_rawprogram_xml: RefCell<Vec<bool>>,
         seal_resign_flags: RefCell<Vec<bool>>,
+        sealed_input_artifacts: RefCell<Vec<Vec<crate::integrity::ManifestArtifact>>>,
+        mutate_stage_input: bool,
     }
 
     impl TestPipelineOps {
@@ -4546,16 +4585,35 @@ mod tests {
         fn seal_resign_flags(&self) -> Vec<bool> {
             self.seal_resign_flags.borrow().clone()
         }
+
+        fn sealed_input_artifacts(&self) -> Vec<Vec<crate::integrity::ManifestArtifact>> {
+            self.sealed_input_artifacts.borrow().clone()
+        }
+
+        fn mutating_stage_input() -> Self {
+            Self {
+                mutate_stage_input: true,
+                ..Self::default()
+            }
+        }
+
+        fn maybe_mutate_input(&self, input: &Path) -> anyhow::Result<()> {
+            if self.mutate_stage_input {
+                fs::write(input.join("source.img"), b"mutated-during-stage")?;
+            }
+            Ok(())
+        }
     }
 
     impl PipelineOps for TestPipelineOps {
         fn unpack_stage(
             &self,
-            _input: &Path,
+            input: &Path,
             out_dir: &Path,
             _events: &mut dyn EventSink,
         ) -> anyhow::Result<()> {
             self.record("unpack_stage");
+            self.maybe_mutate_input(input)?;
             fs::create_dir_all(out_dir)?;
             Ok(())
         }
@@ -4583,7 +4641,7 @@ mod tests {
 
         fn apply_stage(
             &self,
-            _input: &Path,
+            input: &Path,
             out_dir: &Path,
             _ota_zips: &[PathBuf],
             force_unpack: bool,
@@ -4591,6 +4649,7 @@ mod tests {
             _events: &mut dyn EventSink,
         ) -> anyhow::Result<()> {
             self.record(format!("apply_stage(force_unpack={force_unpack})"));
+            self.maybe_mutate_input(input)?;
             fs::create_dir_all(out_dir)?;
             fs::write(out_dir.join("apply.img"), b"apply")?;
             Ok(())
@@ -4598,12 +4657,13 @@ mod tests {
 
         fn resign_stage(
             &self,
-            _input: &Path,
+            input: &Path,
             out_dir: &Path,
             _config: &ResignConfig,
             _events: &mut dyn EventSink,
         ) -> anyhow::Result<()> {
             self.record("resign_stage");
+            self.maybe_mutate_input(input)?;
             fs::create_dir_all(out_dir)?;
             fs::write(out_dir.join("resign.img"), b"resign")?;
             Ok(())
@@ -4631,11 +4691,12 @@ mod tests {
 
         fn repack_stage(
             &self,
-            _input: &Path,
+            input: &Path,
             out_dir: &Path,
             _events: &mut dyn EventSink,
         ) -> anyhow::Result<()> {
             self.record("repack_stage");
+            self.maybe_mutate_input(input)?;
             fs::create_dir_all(out_dir)?;
             fs::write(out_dir.join("super_1.img"), b"repack")?;
             Ok(())
@@ -4660,11 +4721,15 @@ mod tests {
             &self,
             _output_dir: &Path,
             resign_performed: bool,
+            input_artifacts: &[crate::integrity::ManifestArtifact],
             _integrity_key: Option<&Path>,
             _events: &mut dyn EventSink,
         ) -> anyhow::Result<()> {
             self.record("seal_output");
             self.seal_resign_flags.borrow_mut().push(resign_performed);
+            self.sealed_input_artifacts
+                .borrow_mut()
+                .push(input_artifacts.to_vec());
             Ok(())
         }
     }
@@ -4677,7 +4742,7 @@ mod tests {
         let mut sink = NoopEventSink;
 
         RealPipelineOps
-            .seal_output(temp.path(), false, None, &mut sink)
+            .seal_output(temp.path(), false, &[], None, &mut sink)
             .unwrap();
 
         let manifest = crate::integrity::read_output_manifest(temp.path()).unwrap();
@@ -4712,7 +4777,7 @@ mod tests {
         let mut sink = NoopEventSink;
 
         RealPipelineOps
-            .seal_output(output.path(), true, None, &mut sink)
+            .seal_output(output.path(), true, &[], None, &mut sink)
             .unwrap();
 
         let manifest = crate::integrity::read_output_manifest(output.path()).unwrap();
@@ -4741,9 +4806,20 @@ mod tests {
         let public_key = keys.path().join("integrity.pub.pem");
         crate::integrity_signature::generate_integrity_keypair(&private_key, &public_key).unwrap();
         let mut sink = NoopEventSink;
+        let input_artifacts = vec![crate::integrity::ManifestArtifact {
+            path: "original/boot.img".to_string(),
+            size: 4,
+            sha256: crate::avb_descriptor::hex_encode(Sha256::digest(b"boot").as_slice()),
+        }];
 
         RealPipelineOps
-            .seal_output(output.path(), false, Some(&private_key), &mut sink)
+            .seal_output(
+                output.path(),
+                false,
+                &input_artifacts,
+                Some(&private_key),
+                &mut sink,
+            )
             .unwrap();
 
         let signature = crate::integrity_signature::verify_output_manifest_signature(
@@ -4752,6 +4828,107 @@ mod tests {
         )
         .unwrap();
         assert!(signature.is_trusted(), "{signature:?}");
+        assert_eq!(
+            crate::integrity::read_output_manifest(output.path())
+                .unwrap()
+                .input_artifacts,
+            input_artifacts
+        );
+    }
+
+    fn assert_original_input_was_sealed(input: &Path, ops: &TestPipelineOps) {
+        assert_eq!(
+            fs::read(input.join("source.img")).unwrap(),
+            b"mutated-during-stage"
+        );
+        let inventories = ops.sealed_input_artifacts();
+        assert_eq!(inventories.len(), 1);
+        assert_eq!(inventories[0].len(), 1);
+        assert_eq!(inventories[0][0].path, "source.img");
+        assert_eq!(inventories[0][0].size, b"original-input".len() as u64);
+        assert_eq!(
+            inventories[0][0].sha256,
+            crate::avb_descriptor::hex_encode(Sha256::digest(b"original-input").as_slice())
+        );
+    }
+
+    #[test]
+    fn all_pipeline_flows_capture_original_input_before_stage_mutation() {
+        let temp = tempdir().unwrap();
+
+        let unpack_input = temp.path().join("unpack-input");
+        fs::create_dir_all(&unpack_input).unwrap();
+        fs::write(unpack_input.join("source.img"), b"original-input").unwrap();
+        let unpack_ops = TestPipelineOps::mutating_stage_input();
+        run_unpack_with_ops(
+            &UnpackRequest {
+                input: unpack_input.clone(),
+                output: temp.path().join("unpack-output"),
+                integrity_key: None,
+                resign: None,
+                repack: false,
+                complete: false,
+            },
+            &mut NoopEventSink,
+            &unpack_ops,
+        )
+        .unwrap();
+        assert_original_input_was_sealed(&unpack_input, &unpack_ops);
+
+        let apply_input = temp.path().join("apply-input");
+        fs::create_dir_all(&apply_input).unwrap();
+        fs::write(apply_input.join("source.img"), b"original-input").unwrap();
+        let apply_ops = TestPipelineOps::mutating_stage_input();
+        run_apply_with_ops(
+            &ApplyRequest {
+                input: apply_input.clone(),
+                output: temp.path().join("apply-output"),
+                integrity_key: None,
+                ota_zips: vec![temp.path().join("ota.zip")],
+                force_unpack: false,
+                resign: None,
+                repack: false,
+                complete: false,
+            },
+            &mut NoopEventSink,
+            &apply_ops,
+        )
+        .unwrap();
+        assert_original_input_was_sealed(&apply_input, &apply_ops);
+
+        let resign_input = temp.path().join("resign-input");
+        fs::create_dir_all(&resign_input).unwrap();
+        fs::write(resign_input.join("source.img"), b"original-input").unwrap();
+        let resign_ops = TestPipelineOps::mutating_stage_input();
+        run_resign_with_ops(
+            &ResignRequest {
+                input: resign_input.clone(),
+                output: temp.path().join("resign-output"),
+                integrity_key: None,
+                config: sample_resign_config(),
+                repack: false,
+            },
+            &mut NoopEventSink,
+            &resign_ops,
+        )
+        .unwrap();
+        assert_original_input_was_sealed(&resign_input, &resign_ops);
+
+        let repack_input = temp.path().join("repack-input");
+        fs::create_dir_all(&repack_input).unwrap();
+        fs::write(repack_input.join("source.img"), b"original-input").unwrap();
+        let repack_ops = TestPipelineOps::mutating_stage_input();
+        run_repack_with_ops(
+            &RepackRequest {
+                input: repack_input.clone(),
+                output: temp.path().join("repack-output"),
+                integrity_key: None,
+            },
+            &mut NoopEventSink,
+            &repack_ops,
+        )
+        .unwrap();
+        assert_original_input_was_sealed(&repack_input, &repack_ops);
     }
 
     #[test]

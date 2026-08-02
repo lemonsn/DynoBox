@@ -1,14 +1,17 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::integrity::{
-    MANIFEST_FILE_NAME, ManifestIssue, ManifestVerificationReport, verify_output_manifest,
+    MANIFEST_FILE_NAME, ManifestIssue, ManifestVerificationReport, OutputManifest,
+    parse_output_manifest_bytes, verify_output_manifest_bytes,
 };
 use crate::integrity_signature::{
-    ManifestSignatureVerification, SignatureTrustStatus, verify_output_manifest_signature,
+    ManifestSignatureVerification, SignatureTrustStatus, TrustedSignerIdentity,
+    verify_output_manifest_signature_bytes,
 };
 
 use crate::events::{EventSink, MessageLevel, ProgressEvent, StageKind};
@@ -42,6 +45,11 @@ pub struct VerificationReport {
     pub input: PathBuf,
     pub artifact_integrity: Option<ManifestVerificationReport>,
     pub manifest_signature: Option<ManifestSignatureVerification>,
+    /// Number of original input-image digests recorded by the manifest.
+    pub manifest_input_artifact_count: Option<usize>,
+    /// True when local semantic checks were replaced by a trusted signed
+    /// manifest attestation at the caller's explicit request.
+    pub semantic_verification_attested: bool,
     pub image_file_count: usize,
     pub avb_image_count: usize,
     pub rawprogram_xml_count: usize,
@@ -54,11 +62,27 @@ impl VerificationReport {
     pub fn is_clean(&self) -> bool {
         self.failures.is_empty()
     }
+
+    /// Whether every condition for displaying the built-in andtabcus proof is
+    /// satisfied by this complete report.
+    pub fn is_andtabcus_verified(&self) -> bool {
+        self.is_clean()
+            && self.manifest_input_artifact_count.is_some()
+            && self
+                .artifact_integrity
+                .as_ref()
+                .is_some_and(ManifestVerificationReport::is_ok)
+            && self.manifest_signature.as_ref().is_some_and(|signature| {
+                signature.status == SignatureTrustStatus::ValidTrusted
+                    && signature.identity == Some(TrustedSignerIdentity::Andtabcus)
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VerificationOptions {
     pub trusted_integrity_keys: Vec<PathBuf>,
+    pub trust_manifest_attestation: bool,
 }
 
 pub fn verify_input(input: &Path) -> anyhow::Result<VerificationReport> {
@@ -69,25 +93,49 @@ pub fn verify_input_with_options(
     input: &Path,
     options: &VerificationOptions,
 ) -> anyhow::Result<VerificationReport> {
-    let mut report = verify_input_semantic(input)?;
-    attach_output_manifest_verification(input, &mut report);
-    attach_manifest_signature_verification(input, options, &mut report);
+    let mut report = new_verification_report(input)?;
+    let manifest_bytes = load_manifest_snapshot(input, &mut report);
+    let parsed_manifest = manifest_bytes.as_deref().and_then(|bytes| {
+        attach_output_manifest_verification(input, bytes, &mut report);
+        parse_output_manifest_bytes(bytes).ok()
+    });
+    attach_manifest_signature_verification(input, manifest_bytes.as_deref(), options, &mut report);
+
+    if let Some(manifest) = &parsed_manifest {
+        report.manifest_input_artifact_count = Some(manifest.input_artifacts.len());
+    }
+
+    if should_accept_manifest_attestation(options, &report, parsed_manifest.as_ref()) {
+        report.semantic_verification_attested = true;
+    } else {
+        verify_input_semantic_into(input, &mut report)?;
+    }
     Ok(report)
 }
 
 fn verify_input_semantic(input: &Path) -> anyhow::Result<VerificationReport> {
-    let mut report = VerificationReport {
+    let mut report = new_verification_report(input)?;
+    verify_input_semantic_into(input, &mut report)?;
+    Ok(report)
+}
+
+fn new_verification_report(input: &Path) -> anyhow::Result<VerificationReport> {
+    Ok(VerificationReport {
         input: input.to_path_buf(),
         artifact_integrity: None,
         manifest_signature: None,
+        manifest_input_artifact_count: None,
+        semantic_verification_attested: false,
         image_file_count: count_image_files(input)?,
         avb_image_count: 0,
         rawprogram_xml_count: count_rawprogram_xml_files(input)?,
         super_chunk_count: count_super_chunks(input)?,
         super_layout: None,
         failures: Vec::new(),
-    };
+    })
+}
 
+fn verify_input_semantic_into(input: &Path, report: &mut VerificationReport) -> anyhow::Result<()> {
     if report.image_file_count == 0
         && report.rawprogram_xml_count == 0
         && report.super_chunk_count == 0
@@ -97,7 +145,7 @@ fn verify_input_semantic(input: &Path) -> anyhow::Result<VerificationReport> {
             path: Some(input.to_path_buf()),
             message: "No .img files or rawprogram XML files found.".to_string(),
         });
-        return Ok(report);
+        return Ok(());
     }
 
     // Parse XML / super layout before AVB checks so packed dynamic partitions
@@ -248,21 +296,76 @@ fn verify_input_semantic(input: &Path) -> anyhow::Result<VerificationReport> {
         }
     }
 
-    Ok(report)
+    Ok(())
 }
 
-fn attach_output_manifest_verification(input: &Path, report: &mut VerificationReport) {
-    if !input.is_dir() || !input.join(MANIFEST_FILE_NAME).is_file() {
-        return;
+fn load_manifest_snapshot(input: &Path, report: &mut VerificationReport) -> Option<Vec<u8>> {
+    if !input.is_dir() {
+        return None;
     }
 
-    let integrity =
-        verify_output_manifest(input).unwrap_or_else(|error| ManifestVerificationReport {
+    let manifest_path = input.join(MANIFEST_FILE_NAME);
+    match fs::symlink_metadata(&manifest_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            attach_manifest_snapshot_error(report, &manifest_path, error.to_string());
+            return None;
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            attach_manifest_snapshot_error(
+                report,
+                &manifest_path,
+                format!(
+                    "manifest must be a regular file, not a symlink or special file: {}",
+                    manifest_path.display()
+                ),
+            );
+            return None;
+        }
+        Ok(_) => {}
+    }
+
+    match fs::read(&manifest_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            attach_manifest_snapshot_error(report, &manifest_path, error.to_string());
+            None
+        }
+    }
+}
+
+fn attach_manifest_snapshot_error(
+    report: &mut VerificationReport,
+    manifest_path: &Path,
+    message: String,
+) {
+    let integrity = ManifestVerificationReport {
+        manifest_path: manifest_path.to_path_buf(),
+        issues: vec![ManifestIssue::Malformed {
+            message: message.clone(),
+        }],
+    };
+    report.failures.push(VerificationFailure {
+        kind: VerificationFailureKind::Integrity,
+        path: Some(manifest_path.to_path_buf()),
+        message,
+    });
+    report.artifact_integrity = Some(integrity);
+}
+
+fn attach_output_manifest_verification(
+    input: &Path,
+    manifest_bytes: &[u8],
+    report: &mut VerificationReport,
+) {
+    let integrity = verify_output_manifest_bytes(input, manifest_bytes).unwrap_or_else(|error| {
+        ManifestVerificationReport {
             manifest_path: input.join(MANIFEST_FILE_NAME),
             issues: vec![ManifestIssue::Malformed {
                 message: error.to_string(),
             }],
-        });
+        }
+    });
 
     for issue in &integrity.issues {
         let (path, message) = manifest_issue_details(input, issue);
@@ -307,6 +410,7 @@ fn manifest_issue_details(input: &Path, issue: &ManifestIssue) -> (PathBuf, Stri
 
 fn attach_manifest_signature_verification(
     input: &Path,
+    manifest_bytes: Option<&[u8]>,
     options: &VerificationOptions,
     report: &mut VerificationReport,
 ) {
@@ -314,16 +418,41 @@ fn attach_manifest_signature_verification(
         return;
     }
 
-    let verification =
-        match verify_output_manifest_signature(input, &options.trusted_integrity_keys) {
+    let verification = match manifest_bytes {
+        Some(bytes) => match verify_output_manifest_signature_bytes(
+            input,
+            bytes,
+            &options.trusted_integrity_keys,
+        ) {
             Ok(verification) => verification,
             Err(error) => ManifestSignatureVerification {
                 signature_path: input.join(crate::integrity::MANIFEST_SIGNATURE_FILE_NAME),
                 status: SignatureTrustStatus::Invalid,
                 key_id: None,
+                identity: None,
                 issue: Some(error.to_string()),
             },
-        };
+        },
+        None if input
+            .join(crate::integrity::MANIFEST_SIGNATURE_FILE_NAME)
+            .exists() =>
+        {
+            ManifestSignatureVerification {
+                signature_path: input.join(crate::integrity::MANIFEST_SIGNATURE_FILE_NAME),
+                status: SignatureTrustStatus::Invalid,
+                key_id: None,
+                identity: None,
+                issue: Some("manifest bytes unavailable for signature verification".to_string()),
+            }
+        }
+        None => ManifestSignatureVerification {
+            signature_path: input.join(crate::integrity::MANIFEST_SIGNATURE_FILE_NAME),
+            status: SignatureTrustStatus::Unsigned,
+            key_id: None,
+            identity: None,
+            issue: None,
+        },
+    };
 
     let trust_required = !options.trusted_integrity_keys.is_empty();
     let failure_message = match verification.status {
@@ -349,6 +478,24 @@ fn attach_manifest_signature_verification(
         });
     }
     report.manifest_signature = Some(verification);
+}
+
+fn should_accept_manifest_attestation(
+    options: &VerificationOptions,
+    report: &VerificationReport,
+    manifest: Option<&OutputManifest>,
+) -> bool {
+    options.trust_manifest_attestation
+        && manifest.is_some_and(|manifest| manifest.semantic_verification)
+        && report
+            .artifact_integrity
+            .as_ref()
+            .is_some_and(ManifestVerificationReport::is_ok)
+        && report
+            .manifest_signature
+            .as_ref()
+            .is_some_and(ManifestSignatureVerification::is_trusted)
+        && report.failures.is_empty()
 }
 
 pub fn render_verification_report(report: &VerificationReport) -> String {
@@ -384,18 +531,45 @@ pub fn render_verification_report(report: &VerificationReport) -> String {
                     signature.key_id.as_deref().unwrap_or("unknown key")
                 );
             }
-            SignatureTrustStatus::ValidTrusted => {
-                let _ = writeln!(
-                    out,
-                    "Manifest signature:    VALID, trusted signer ({})",
-                    signature.key_id.as_deref().unwrap_or("unknown key")
-                );
-            }
+            SignatureTrustStatus::ValidTrusted => match signature.identity {
+                Some(TrustedSignerIdentity::Andtabcus) => {
+                    let _ = writeln!(
+                        out,
+                        "Manifest signature:    VALID, trusted andtabcus signer ({})",
+                        signature.key_id.as_deref().unwrap_or("unknown key")
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "Manifest signature:    VALID, trusted signer ({})",
+                        signature.key_id.as_deref().unwrap_or("unknown key")
+                    );
+                }
+            },
             SignatureTrustStatus::Invalid => {
                 out.push_str("Manifest signature:    INVALID\n");
             }
         },
         None => out.push_str("Manifest signature:    NOT CHECKED\n"),
+    }
+    match report.manifest_input_artifact_count {
+        Some(count) => {
+            let _ = writeln!(out, "Original input digests: {count} image(s) recorded");
+        }
+        None => out.push_str("Original input digests: NOT RECORDED\n"),
+    }
+    if report.semantic_verification_attested {
+        out.push_str(
+            "Semantic verification: ACCEPTED from trusted signed manifest (local AVB/XML/super skipped)\n",
+        );
+    } else {
+        out.push_str("Semantic verification: performed locally\n");
+    }
+    if report.is_andtabcus_verified() {
+        out.push_str("+--------------------+\n");
+        out.push_str("| ANDTABCUS VERIFIED |\n");
+        out.push_str("+--------------------+\n");
     }
     let _ = writeln!(out, "Image files scanned:    {}", report.image_file_count);
     let _ = writeln!(out, "AVB images detected:    {}", report.avb_image_count);
@@ -879,12 +1053,15 @@ mod tests {
 
     use crate::integrity::write_output_manifest_for_dir;
     use crate::integrity_signature::{
-        SignatureTrustStatus, generate_integrity_keypair, sign_output_manifest,
+        SignatureTrustStatus, TrustedSignerIdentity, generate_integrity_keypair,
+        sign_output_manifest,
     };
 
     use super::{
-        VerificationFailureKind, VerificationOptions, expected_chain_partitions_from_info,
-        render_verification_report, verify_input, verify_input_with_options,
+        VerificationFailureKind, VerificationOptions, attach_manifest_signature_verification,
+        attach_output_manifest_verification, expected_chain_partitions_from_info,
+        new_verification_report, render_verification_report, verify_input,
+        verify_input_with_options,
     };
 
     #[test]
@@ -948,11 +1125,14 @@ mod tests {
             untrusted.manifest_signature.as_ref().unwrap().status,
             SignatureTrustStatus::ValidUntrusted
         );
+        assert!(!untrusted.semantic_verification_attested);
+        assert!(!untrusted.is_andtabcus_verified());
 
         let trusted = verify_input_with_options(
             output.path(),
             &VerificationOptions {
                 trusted_integrity_keys: vec![public_key],
+                trust_manifest_attestation: true,
             },
         )
         .unwrap();
@@ -961,6 +1141,10 @@ mod tests {
             trusted.manifest_signature.as_ref().unwrap().status,
             SignatureTrustStatus::ValidTrusted
         );
+        assert!(trusted.semantic_verification_attested);
+        assert_eq!(trusted.manifest_signature.as_ref().unwrap().identity, None);
+        assert!(!trusted.is_andtabcus_verified());
+        assert!(!render_verification_report(&trusted).contains("ANDTABCUS VERIFIED"));
 
         let wrong_private = keys.path().join("wrong.pem");
         let wrong_public = keys.path().join("wrong.pub.pem");
@@ -969,6 +1153,7 @@ mod tests {
             output.path(),
             &VerificationOptions {
                 trusted_integrity_keys: vec![wrong_public],
+                trust_manifest_attestation: true,
             },
         )
         .unwrap();
@@ -979,6 +1164,143 @@ mod tests {
                 .iter()
                 .any(|failure| failure.kind == VerificationFailureKind::Signature)
         );
+        assert!(!wrong_trust.semantic_verification_attested);
+    }
+
+    #[test]
+    fn andtabcus_fixture_gets_banner_and_opt_in_attestation_only_when_clean() {
+        let output = tempdir().unwrap();
+        fs::write(output.path().join("boot.img"), b"boot").unwrap();
+        fs::write(
+            output.path().join(crate::integrity::MANIFEST_FILE_NAME),
+            include_bytes!("../testdata/andtabcus-manifest.json"),
+        )
+        .unwrap();
+        fs::write(
+            output
+                .path()
+                .join(crate::integrity::MANIFEST_SIGNATURE_FILE_NAME),
+            include_bytes!("../testdata/andtabcus-manifest.sig"),
+        )
+        .unwrap();
+
+        let default_report = verify_input(output.path()).unwrap();
+        assert!(default_report.is_clean(), "{:?}", default_report.failures);
+        assert!(!default_report.semantic_verification_attested);
+        assert!(default_report.is_andtabcus_verified());
+
+        let options = VerificationOptions {
+            trusted_integrity_keys: Vec::new(),
+            trust_manifest_attestation: true,
+        };
+        let fast_report = verify_input_with_options(output.path(), &options).unwrap();
+        assert!(fast_report.is_clean(), "{:?}", fast_report.failures);
+        assert!(fast_report.semantic_verification_attested);
+        assert_eq!(fast_report.manifest_input_artifact_count, Some(0));
+        assert_eq!(
+            fast_report.manifest_signature.as_ref().unwrap().identity,
+            Some(TrustedSignerIdentity::Andtabcus)
+        );
+        let text = render_verification_report(&fast_report);
+        assert!(
+            text.contains("+--------------------+\n| ANDTABCUS VERIFIED |\n+--------------------+")
+        );
+        assert!(text.contains("ACCEPTED from trusted signed manifest"));
+        assert!(text.contains("Original input digests: 0 image(s) recorded"));
+        let json = serde_json::to_value(&fast_report).unwrap();
+        assert_eq!(
+            json["manifest_signature"]["identity"],
+            serde_json::json!("andtabcus")
+        );
+        assert_eq!(json["semantic_verification_attested"], true);
+
+        fs::write(output.path().join("boot.img"), b"tampered").unwrap();
+        let tampered_artifact = verify_input_with_options(output.path(), &options).unwrap();
+        assert!(!tampered_artifact.is_clean());
+        assert!(!tampered_artifact.semantic_verification_attested);
+        assert!(!tampered_artifact.is_andtabcus_verified());
+        assert!(!render_verification_report(&tampered_artifact).contains("ANDTABCUS VERIFIED"));
+    }
+
+    #[test]
+    fn artifact_and_signature_checks_share_the_supplied_manifest_snapshot() {
+        let output = tempdir().unwrap();
+        fs::write(output.path().join("boot.img"), b"boot").unwrap();
+        let manifest_bytes = include_bytes!("../testdata/andtabcus-manifest.json");
+        fs::write(
+            output.path().join(crate::integrity::MANIFEST_FILE_NAME),
+            manifest_bytes,
+        )
+        .unwrap();
+        fs::write(
+            output
+                .path()
+                .join(crate::integrity::MANIFEST_SIGNATURE_FILE_NAME),
+            include_bytes!("../testdata/andtabcus-manifest.sig"),
+        )
+        .unwrap();
+
+        let snapshot = fs::read(output.path().join(crate::integrity::MANIFEST_FILE_NAME)).unwrap();
+        fs::write(
+            output.path().join(crate::integrity::MANIFEST_FILE_NAME),
+            b"{}\n",
+        )
+        .unwrap();
+
+        let mut report = new_verification_report(output.path()).unwrap();
+        attach_output_manifest_verification(output.path(), &snapshot, &mut report);
+        attach_manifest_signature_verification(
+            output.path(),
+            Some(&snapshot),
+            &VerificationOptions::default(),
+            &mut report,
+        );
+        assert!(
+            report
+                .artifact_integrity
+                .as_ref()
+                .is_some_and(|integrity| integrity.is_ok())
+        );
+        assert_eq!(
+            report.manifest_signature.as_ref().unwrap().identity,
+            Some(TrustedSignerIdentity::Andtabcus)
+        );
+    }
+
+    #[test]
+    fn tampered_andtabcus_signature_has_no_identity_banner_or_fast_path() {
+        let output = tempdir().unwrap();
+        fs::write(output.path().join("boot.img"), b"boot").unwrap();
+        fs::write(
+            output.path().join(crate::integrity::MANIFEST_FILE_NAME),
+            include_bytes!("../testdata/andtabcus-manifest.json"),
+        )
+        .unwrap();
+        let tampered_signature =
+            String::from_utf8(include_bytes!("../testdata/andtabcus-manifest.sig").to_vec())
+                .unwrap()
+                .replacen("f7ab3e", "07ab3e", 1);
+        fs::write(
+            output
+                .path()
+                .join(crate::integrity::MANIFEST_SIGNATURE_FILE_NAME),
+            tampered_signature,
+        )
+        .unwrap();
+
+        let report = verify_input_with_options(
+            output.path(),
+            &VerificationOptions {
+                trusted_integrity_keys: Vec::new(),
+                trust_manifest_attestation: true,
+            },
+        )
+        .unwrap();
+        assert!(!report.is_clean());
+        assert!(!report.semantic_verification_attested);
+        assert_eq!(report.manifest_signature.as_ref().unwrap().identity, None);
+        assert!(!report.is_andtabcus_verified());
+        assert!(!render_verification_report(&report).contains("ANDTABCUS VERIFIED"));
     }
 
     #[test]

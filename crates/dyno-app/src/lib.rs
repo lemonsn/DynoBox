@@ -23,15 +23,18 @@ pub use integrity::{
     MANIFEST_FILE_NAME, MANIFEST_SCHEMA, MANIFEST_SIGNATURE_FILE_NAME, MANIFEST_VERSION,
     ManifestArtifact, ManifestIssue, ManifestVerificationReport, OutputManifest,
     OutputManifestOptions, REPORT_FILE_NAME, RESIGN_EXCLUDED_ROOT_ARTIFACT, build_output_manifest,
-    build_output_manifest_with_options, dynobox_generator_version, read_output_manifest,
-    serialize_manifest, verify_output_manifest, write_output_manifest,
-    write_output_manifest_for_dir, write_output_manifest_for_dir_with_options,
+    build_output_manifest_with_input_artifacts, build_output_manifest_with_options,
+    collect_input_image_artifacts, dynobox_generator_version, parse_output_manifest_bytes,
+    read_output_manifest, serialize_manifest, verify_output_manifest, verify_output_manifest_bytes,
+    write_output_manifest, write_output_manifest_for_dir,
+    write_output_manifest_for_dir_with_input_artifacts, write_output_manifest_for_dir_with_options,
 };
 pub use integrity_signature::{
-    ManifestSignatureEnvelope, ManifestSignatureVerification, SIGNATURE_ALGORITHM,
-    SIGNATURE_SCHEMA, SIGNATURE_VERSION, SignatureTrustStatus, generate_integrity_keypair,
+    ANDTABCUS_KEY_ID, ANDTABCUS_PUBLIC_KEY_HEX, ManifestSignatureEnvelope,
+    ManifestSignatureVerification, SIGNATURE_ALGORITHM, SIGNATURE_SCHEMA, SIGNATURE_VERSION,
+    SignatureTrustStatus, TrustedSignerIdentity, generate_integrity_keypair,
     integrity_signing_key_id, serialize_signature_envelope, sign_output_manifest,
-    verify_output_manifest_signature,
+    verify_output_manifest_signature, verify_output_manifest_signature_bytes,
 };
 pub use pipeline::{
     ApplyRequest, RepackRequest, ResignConfig, ResignRequest, UnpackRequest,
