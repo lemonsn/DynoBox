@@ -46,9 +46,9 @@ use crate::dex_patch::{
     force_field_const_bool, force_fragment_render_gone, force_invoke_const_bool,
     force_invoke_const_int, force_method_broadcast_finish, force_method_return_bool,
     force_method_return_int, force_method_return_void, force_nop_anchored_invoke,
-    force_remoteviews_gone, force_view_gone, parse_method_descriptor, patch_method_code,
-    redirect_intent_action_to_broadcast, resolve_dex_pool_symbol,
-    validate_method_code_template_slots,
+    force_preference_controller_hidden, force_remoteviews_gone, force_view_gone,
+    parse_method_descriptor, patch_method_code, redirect_intent_action_to_broadcast,
+    resolve_dex_pool_symbol, validate_method_code_template_slots,
 };
 use crate::ext4_helpers::{lookup_inode_at_path, open_ext4_volume, write_via_extents};
 use crate::fuck_lgsi::{
@@ -205,6 +205,15 @@ pub enum DbpOp {
         #[serde(default, rename = "replacement")]
         replacements: Vec<DbpCodeReplacement>,
     },
+    /// Hide one exact field-backed SwitchPreference controller entry by
+    /// rewriting its `displayPreference(PreferenceScreen)` body in place.
+    PreferenceControllerHide {
+        partition: String,
+        file: String,
+        class: String,
+        preference_key: String,
+        preference_field: String,
+    },
     /// Force a compiled boolean resource inside a STORED `resources.arsc` APK
     /// entry to `value`.
     ResourceBool {
@@ -358,6 +367,7 @@ impl DbpOp {
             | DbpOp::MethodConstInt { partition, .. }
             | DbpOp::MethodNop { partition, .. }
             | DbpOp::MethodCodePatch { partition, .. }
+            | DbpOp::PreferenceControllerHide { partition, .. }
             | DbpOp::ResourceBool { partition, .. }
             | DbpOp::ResourceDimen { partition, .. }
             | DbpOp::TextReplace { partition, .. }
@@ -379,6 +389,7 @@ impl DbpOp {
             | DbpOp::MethodConstInt { file, .. }
             | DbpOp::MethodNop { file, .. }
             | DbpOp::MethodCodePatch { file, .. }
+            | DbpOp::PreferenceControllerHide { file, .. }
             | DbpOp::ResourceBool { file, .. }
             | DbpOp::ResourceDimen { file, .. }
             | DbpOp::TextReplace { file, .. }
@@ -626,6 +637,30 @@ pub fn load_dbp(path: &Path) -> Result<DbpDocument> {
                             symbol.name()
                         )));
                     }
+                }
+            }
+            DbpOp::PreferenceControllerHide {
+                class,
+                preference_key,
+                preference_field,
+                ..
+            } => {
+                if !class_descriptor_is_valid(class) {
+                    return Err(bail(format!(
+                        "preference_controller_hide `class` must be a JVM descriptor like `Lcom/x/Y;`, got `{class}`"
+                    )));
+                }
+                if preference_key.is_empty() || preference_key.contains('\0') {
+                    return Err(bail(
+                        "preference_controller_hide `preference_key` must be a non-empty DEX string"
+                            .to_string(),
+                    ));
+                }
+                if preference_field.is_empty() {
+                    return Err(bail(
+                        "preference_controller_hide `preference_field` must not be empty"
+                            .to_string(),
+                    ));
                 }
             }
             DbpOp::ResourceBool { resource, .. } => {
@@ -1381,6 +1416,12 @@ fn apply_one_op(dex: &mut [u8], op: &DbpOp) -> Result<bool> {
                 .collect();
             patch_method_code(dex, class, method, &ret, &param_refs, &code_replacements)
         }
+        DbpOp::PreferenceControllerHide {
+            class,
+            preference_key,
+            preference_field,
+            ..
+        } => force_preference_controller_hidden(dex, class, preference_key, preference_field),
         DbpOp::InvokeConstBool {
             scan_class,
             scan_method,
@@ -2564,9 +2605,10 @@ value = false
         let ds2 =
             load_dbp(&patches_dir().join("debloat-settings.dbp")).expect("debloat-settings.dbp");
         assert_eq!(ds2.name, "debloat-settings");
-        assert_eq!(ds2.ops.len(), 4);
+        assert_eq!(ds2.ops.len(), 5);
         let mut hide = false;
         let mut show = false;
+        let mut hide_user_experience = false;
         let mut hotline_prc = false;
         let mut hotline_row = false;
         for op in &ds2.ops {
@@ -2589,6 +2631,22 @@ value = false
                         show = true;
                     }
                 }
+                DbpOp::PreferenceControllerHide {
+                    file,
+                    class,
+                    preference_key,
+                    preference_field,
+                    ..
+                } => {
+                    assert_eq!(file, "system/priv-app/ZuiSettings/ZuiSettings.apk");
+                    assert_eq!(
+                        class,
+                        "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;"
+                    );
+                    assert_eq!(preference_key, "user_experience");
+                    assert_eq!(preference_field, "mUserExperience");
+                    hide_user_experience = true;
+                }
                 DbpOp::InvokeConstBool {
                     scan_class,
                     target_method,
@@ -2608,6 +2666,10 @@ value = false
         }
         assert!(hide, "must hide the LeCloud tile (-> 3)");
         assert!(show, "must show the Accounts & sync entry (-> 0)");
+        assert!(
+            hide_user_experience,
+            "must hide the orphaned User Experience preference through its controller"
+        );
         assert!(
             hotline_prc && hotline_row,
             "must flip the hotline region gate to ROW (isPrcVersion->false, isRowVersion->true)"
@@ -3154,6 +3216,7 @@ value = false
         let doc = load_dbp(&patches_dir().join("debloat-settings.dbp")).unwrap();
         let dir = std::path::Path::new(&dir);
         let mut landed = 0usize;
+        let mut user_experience_landed = 0usize;
         for name in [
             "classes.dex",
             "classes2.dex",
@@ -3169,6 +3232,16 @@ value = false
             for op in &doc.ops {
                 if apply_one_op(&mut dex, op).unwrap() {
                     landed += 1;
+                    if matches!(
+                        op,
+                        DbpOp::PreferenceControllerHide { class, preference_key, preference_field, .. }
+                            if class
+                                == "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;"
+                                && preference_key == "user_experience"
+                                && preference_field == "mUserExperience"
+                    ) {
+                        user_experience_landed += 1;
+                    }
                     modified = true;
                 }
             }
@@ -3179,7 +3252,11 @@ value = false
                 }
             }
         }
-        assert_eq!(landed, 4, "all four debloat-settings ops should land");
+        assert_eq!(
+            user_experience_landed, 1,
+            "UserExperienceSwitchController visibility override should land exactly once"
+        );
+        assert_eq!(landed, 5, "all five debloat-settings ops should land");
     }
 
     /// The deduplicated-code-item guard: forcing the "Service hotline"
@@ -4016,6 +4093,41 @@ value = 1
         );
         let err = load_dbp(f.path()).unwrap_err().to_string();
         assert!(err.contains("integer"), "got: {err}");
+    }
+
+    #[test]
+    fn load_validates_preference_controller_hide_fields() {
+        for (class, key, field, expected) in [
+            ("bad", "user_experience", "mUserExperience", "class"),
+            (
+                "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;",
+                "",
+                "mUserExperience",
+                "preference_key",
+            ),
+            (
+                "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;",
+                "user_experience",
+                "",
+                "preference_field",
+            ),
+        ] {
+            let body = format!(
+                r#"
+name = "t"
+[[op]]
+kind = "preference_controller_hide"
+partition = "system"
+file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
+class = "{class}"
+preference_key = "{key}"
+preference_field = "{field}"
+"#
+            );
+            let f = write_temp_dbp(&body);
+            let err = load_dbp(f.path()).unwrap_err().to_string();
+            assert!(err.contains(expected), "got: {err}");
+        }
     }
 
     #[test]

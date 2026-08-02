@@ -1,7 +1,8 @@
-# Hide LeCloud and Service hotline entries, and show AOSP Accounts & sync.
+# Hide LeCloud, Service hotline, and the orphaned User Experience entry,
+# and show AOSP Accounts & sync.
 
 name = "debloat-settings"
-description = "Hide the ZuiSettings LeCloud account tile + Service hotline, and always show the AOSP Accounts & sync entry."
+description = "Hide the ZuiSettings LeCloud account tile, Service hotline, and orphaned User Experience entry, and always show the AOSP Accounts & sync entry."
 
 [[op]]
 kind = "method_const_int"
@@ -10,6 +11,14 @@ file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
 class = "Lcom/lenovo/settings/homepage/controller/TopLevelLenovoAccountPreferenceController;"
 method = "getAvailabilityStatus"
 value = 3
+
+[[op]]
+kind = "preference_controller_hide"
+partition = "system"
+file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
+class = "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;"
+preference_key = "user_experience"
+preference_field = "mUserExperience"
 
 [[op]]
 kind = "method_const_int"

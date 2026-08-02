@@ -23,6 +23,9 @@
 //!   `sendBroadcast`, without editing the sorted dex string-data table.
 //! * [`force_method_broadcast_finish`] — rewrite an Activity method body to
 //!   call `super`, `finish()`, broadcast an existing action string, and return.
+//! * [`force_preference_controller_hidden`] — replace one exact Lenovo/AOSP
+//!   `displayPreference` implementation with an equivalent binding sequence
+//!   that preserves its `SwitchPreference` field and calls `setVisible(false)`.
 //! * [`patch_method_code`] — atomically apply ordered, exact same-length byte
 //!   replacements inside one fully-qualified method body. This is the escape
 //!   hatch for control-flow fixes that cannot be expressed by the higher-level
@@ -576,6 +579,261 @@ pub fn patch_method_code(
 
     validate_method_control_flow(&working)?;
     dex[insns_start..insns_end].copy_from_slice(&working);
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// primitive 0b: hide one field-backed preference controller entry
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct PreferenceControllerRefs {
+    super_display: u16,
+    get_key: u16,
+    find_preference: u16,
+    switch_type: u16,
+    preference_field: u16,
+    update_description: u16,
+    preference_key: u16,
+    set_visible: u16,
+}
+
+fn push_invoke_35c(out: &mut Vec<u8>, opcode: u8, method_idx: u16, regs: &[u8]) -> Option<()> {
+    if regs.len() > 5 || regs.iter().any(|&reg| reg >= 16) {
+        return None;
+    }
+    let mut encoded = [0u8; 6];
+    encoded[0] = opcode;
+    encoded[1] = (regs.len() as u8) << 4;
+    encoded[2..4].copy_from_slice(&method_idx.to_le_bytes());
+    if let Some(&reg) = regs.first() {
+        encoded[4] |= reg;
+    }
+    if let Some(&reg) = regs.get(1) {
+        encoded[4] |= reg << 4;
+    }
+    if let Some(&reg) = regs.get(2) {
+        encoded[5] |= reg;
+    }
+    if let Some(&reg) = regs.get(3) {
+        encoded[5] |= reg << 4;
+    }
+    if let Some(&reg) = regs.get(4) {
+        encoded[1] |= reg;
+    }
+    out.extend_from_slice(&encoded);
+    Some(())
+}
+
+fn encode_original_preference_controller_body(
+    refs: PreferenceControllerRefs,
+    this_reg: u8,
+    screen_reg: u8,
+    scratch_reg: u8,
+) -> Option<Vec<u8>> {
+    let mut body = Vec::with_capacity(38);
+    push_invoke_35c(&mut body, 0x6f, refs.super_display, &[this_reg, screen_reg])?;
+    push_invoke_35c(&mut body, 0x6e, refs.get_key, &[this_reg])?;
+    body.extend_from_slice(&[0x0c, scratch_reg]); // move-result-object
+    push_invoke_35c(
+        &mut body,
+        0x6e,
+        refs.find_preference,
+        &[screen_reg, scratch_reg],
+    )?;
+    body.extend_from_slice(&[0x0c, screen_reg]); // move-result-object
+    body.extend_from_slice(&[0x1f, screen_reg]); // check-cast
+    body.extend_from_slice(&refs.switch_type.to_le_bytes());
+    body.extend_from_slice(&[0x5b, (this_reg << 4) | screen_reg]); // iput-object
+    body.extend_from_slice(&refs.preference_field.to_le_bytes());
+    push_invoke_35c(&mut body, 0x70, refs.update_description, &[this_reg])?;
+    body.extend_from_slice(&[0x0e, 0x00]); // return-void
+    Some(body)
+}
+
+fn encode_hidden_preference_controller_body(
+    refs: PreferenceControllerRefs,
+    this_reg: u8,
+    screen_reg: u8,
+    scratch_reg: u8,
+) -> Option<Vec<u8>> {
+    let mut body = Vec::with_capacity(38);
+    push_invoke_35c(&mut body, 0x6f, refs.super_display, &[this_reg, screen_reg])?;
+    body.extend_from_slice(&[0x1a, scratch_reg]); // const-string
+    body.extend_from_slice(&refs.preference_key.to_le_bytes());
+    push_invoke_35c(
+        &mut body,
+        0x6e,
+        refs.find_preference,
+        &[screen_reg, scratch_reg],
+    )?;
+    body.extend_from_slice(&[0x0c, screen_reg]); // move-result-object
+    body.extend_from_slice(&[0x1f, screen_reg]); // check-cast
+    body.extend_from_slice(&refs.switch_type.to_le_bytes());
+    body.extend_from_slice(&[0x5b, (this_reg << 4) | screen_reg]); // iput-object
+    body.extend_from_slice(&refs.preference_field.to_le_bytes());
+    body.extend_from_slice(&[0x12, scratch_reg]); // const/4 scratch, #0
+    push_invoke_35c(
+        &mut body,
+        0x6e,
+        refs.set_visible,
+        &[screen_reg, scratch_reg],
+    )?;
+    body.extend_from_slice(&[0x0e, 0x00, 0x00, 0x00]); // return-void; nop
+    Some(body)
+}
+
+/// Hide a `SwitchPreference` owned by an XML-instantiated preference
+/// controller without changing the DEX tables or code-item size.
+///
+/// This intentionally accepts only the exact 19-code-unit Lenovo controller
+/// shape: call `super.displayPreference`, resolve `getPreferenceKey()`, bind
+/// the result to one `SwitchPreference` field, update its description, return.
+/// The replacement still calls `super`, resolves the supplied existing key,
+/// and stores the field (observer callbacks therefore remain safe), then calls
+/// the already-referenced `Preference.setVisible(false)`. It is refused when
+/// the code item is shared, has tries, has unexpected register/header values,
+/// differs by even one instruction, or any required existing pool reference
+/// cannot be resolved.
+pub fn force_preference_controller_hidden(
+    dex: &mut [u8],
+    class_descriptor: &str,
+    preference_key: &str,
+    preference_field: &str,
+) -> Result<bool> {
+    const SCREEN: &str = "Landroidx/preference/PreferenceScreen;";
+    const PREFERENCE: &str = "Landroidx/preference/Preference;";
+    const SWITCH: &str = "Landroidx/preference/SwitchPreference;";
+    const CONTROLLER: &str = "Lcom/android/settings/core/TogglePreferenceController;";
+
+    let h = read_dex_header(dex);
+    let Some(code_off) = find_method_code_off(
+        dex,
+        &h,
+        class_descriptor,
+        "displayPreference",
+        "V",
+        &[SCREEN],
+    )?
+    else {
+        return Ok(false);
+    };
+    if code_off_is_shared(dex, &h, code_off)? || code_off + 16 > dex.len() {
+        return Ok(false);
+    }
+
+    let registers_size = read_u16_le(dex, code_off);
+    let ins_size = read_u16_le(dex, code_off + 2);
+    let outs_size = read_u16_le(dex, code_off + 4);
+    let tries_size = read_u16_le(dex, code_off + 6);
+    let debug_info_off = read_u32_le(dex, code_off + 8) as usize;
+    let insns_size = read_u32_le(dex, code_off + 12) as usize;
+    if registers_size != 3
+        || ins_size != 2
+        || outs_size != 2
+        || tries_size != 0
+        || insns_size != 19
+        || (debug_info_off != 0 && debug_info_off >= dex.len())
+    {
+        return Ok(false);
+    }
+
+    let resolve_method = |class, name, ret, params: &[&str]| {
+        resolve_method_idx(dex, &h, class, name, ret, params)
+            .map(|idx| idx.and_then(|idx| u16::try_from(idx).ok()))
+    };
+    let resolve_type = |descriptor| {
+        dex_walker::find_type_idx(
+            dex,
+            h.string_ids_size,
+            h.string_ids_off,
+            h.type_ids_size,
+            h.type_ids_off,
+            descriptor,
+        )
+        .map(|idx| idx.and_then(|idx| u16::try_from(idx).ok()))
+    };
+
+    let Some(super_display) = resolve_method(CONTROLLER, "displayPreference", "V", &[SCREEN])?
+    else {
+        return Ok(false);
+    };
+    let Some(get_key) = resolve_method(
+        class_descriptor,
+        "getPreferenceKey",
+        "Ljava/lang/String;",
+        &[],
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(find_preference) = resolve_method(
+        SCREEN,
+        "findPreference",
+        PREFERENCE,
+        &["Ljava/lang/CharSequence;"],
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(switch_type) = resolve_type(SWITCH)? else {
+        return Ok(false);
+    };
+    let Some(preference_field) =
+        resolve_field_idx(dex, &h, class_descriptor, preference_field, SWITCH)?
+            .and_then(|idx| u16::try_from(idx).ok())
+    else {
+        return Ok(false);
+    };
+    let Some(update_description) = resolve_method(
+        class_descriptor,
+        "updateUserExperienceDescription",
+        "V",
+        &[],
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(preference_key) = dex_walker::find_string_idx_strict(
+        dex,
+        h.string_ids_size,
+        h.string_ids_off,
+        preference_key,
+    )?
+    .and_then(|idx| u16::try_from(idx).ok()) else {
+        return Ok(false);
+    };
+    let Some(set_visible) = resolve_method(PREFERENCE, "setVisible", "V", &["Z"])? else {
+        return Ok(false);
+    };
+    let refs = PreferenceControllerRefs {
+        super_display,
+        get_key,
+        find_preference,
+        switch_type,
+        preference_field,
+        update_description,
+        preference_key,
+        set_visible,
+    };
+
+    // With three registers and two incoming parameters, p0=v1 and p1=v2.
+    let Some(expected) = encode_original_preference_controller_body(refs, 1, 2, 0) else {
+        return Ok(false);
+    };
+    let Some(replacement) = encode_hidden_preference_controller_body(refs, 1, 2, 0) else {
+        return Ok(false);
+    };
+    if expected.len() != 38 || replacement.len() != expected.len() {
+        return Ok(false);
+    }
+    let insns_off = code_off + 16;
+    let insns_end = insns_off + expected.len();
+    if insns_end > dex.len() || dex[insns_off..insns_end] != expected {
+        return Ok(false);
+    }
+    validate_method_control_flow(&replacement)?;
+    dex[insns_off..insns_end].copy_from_slice(&replacement);
     Ok(true)
 }
 
@@ -2482,6 +2740,41 @@ mod tests {
     }
 
     #[test]
+    fn preference_controller_hide_body_is_size_preserving_and_keeps_field_binding() {
+        let refs = PreferenceControllerRefs {
+            super_display: 0x1111,
+            get_key: 0x2222,
+            find_preference: 0x3333,
+            switch_type: 0x4444,
+            preference_field: 0x5555,
+            update_description: 0x6666,
+            preference_key: 0x7777,
+            set_visible: 0x1234,
+        };
+        let original = encode_original_preference_controller_body(refs, 1, 2, 0).unwrap();
+        let hidden = encode_hidden_preference_controller_body(refs, 1, 2, 0).unwrap();
+
+        assert_eq!(original.len(), 19 * 2);
+        assert_eq!(hidden.len(), original.len());
+        assert_eq!(&hidden[0..6], &[0x6f, 0x20, 0x11, 0x11, 0x21, 0x00]);
+        assert_eq!(&hidden[6..10], &[0x1a, 0x00, 0x77, 0x77]);
+        assert!(
+            hidden
+                .windows(4)
+                .any(|window| window == [0x5b, 0x12, 0x55, 0x55]),
+            "replacement must preserve the mUserExperience field assignment"
+        );
+        assert!(
+            hidden
+                .windows(6)
+                .any(|window| window == [0x6e, 0x20, 0x34, 0x12, 0x02, 0x00]),
+            "replacement must call Preference.setVisible on the bound preference"
+        );
+        assert_eq!(&hidden[34..38], &[0x0e, 0x00, 0x00, 0x00]);
+        assert!(validate_method_control_flow(&hidden).is_ok());
+    }
+
+    #[test]
     fn field_const_bool_rewrites_only_matching_iget_boolean() {
         // iget-boolean v3,v7,field@0x1234; unrelated iget-boolean; return-void
         let mut insns = vec![0x55, 0x73, 0x34, 0x12, 0x55, 0x21, 0x78, 0x56, 0x0e, 0x00];
@@ -2759,6 +3052,53 @@ mod tests {
             }
         }
         assert_eq!(hits, 1, "power behavior resolver should be forced once");
+    }
+
+    /// The exact, structure-validated User Experience preference rewrite must
+    /// land in one real ZuiSettings dex and refuse a second application. Set
+    /// `DYNOBOX_ZUISETTINGS_DEX_DIR` to extracted original APK dexes.
+    #[test]
+    fn preference_controller_hide_lands_on_real_zuisettings() {
+        let Ok(dir) = std::env::var("DYNOBOX_ZUISETTINGS_DEX_DIR") else {
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let mut hits = 0usize;
+        for name in [
+            "classes.dex",
+            "classes2.dex",
+            "classes3.dex",
+            "classes4.dex",
+            "classes5.dex",
+            "classes6.dex",
+        ] {
+            let Ok(mut dex) = std::fs::read(dir.join(name)) else {
+                continue;
+            };
+            let len = dex.len();
+            if force_preference_controller_hidden(
+                &mut dex,
+                "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;",
+                "user_experience",
+                "mUserExperience",
+            )
+            .expect("patch")
+            {
+                hits += 1;
+                assert_eq!(dex.len(), len, "DEX length must remain unchanged");
+                assert!(
+                    !force_preference_controller_hidden(
+                        &mut dex,
+                        "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;",
+                        "user_experience",
+                        "mUserExperience",
+                    )
+                    .expect("second patch"),
+                    "the exact-original guard must refuse an already-patched body"
+                );
+            }
+        }
+        assert_eq!(hits, 1, "visibility rewrite should land in exactly one dex");
     }
 
     /// `force_invoke_const_bool` rewrites the real ZuiSettings
