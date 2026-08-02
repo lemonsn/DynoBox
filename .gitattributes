@@ -1,0 +1,3 @@
+# Detached Ed25519 fixtures sign these exact textual bytes.
+/crates/dyno-app/testdata/andtabcus-manifest.json text eol=lf
+/crates/dyno-app/testdata/andtabcus-manifest.sig text eol=lf
