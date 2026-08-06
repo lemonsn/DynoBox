@@ -11,10 +11,10 @@ description = "Super image parsing and chunk-planning crate for DynoBox"
 crc32fast = "1.5.0"
 dynobox-core.workspace = true
 dynobox-xml.workspace = true
-regex = "1.12.3"
+regex = "1.13.1"
 sha2 = "0.11.0"
 tracing.workspace = true
-zerocopy = { version = "0.8.48", features = ["derive"] }
+zerocopy = { version = "0.8.55", features = ["derive"] }
 
 [dev-dependencies]
 tempfile.workspace = true
