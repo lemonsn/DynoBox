@@ -28,3 +28,10 @@ partition = "product"
 file = "etc/sysconfig/google.xml"
 from = "    <!-- TODO: This is a temporary workaround for allowing GmsCore to receive this broadcast.\n         This can be removed once OneTimeInitializer functionality is moved to GmsCore. -->\n"
 to = "    <feature name=\"com.google.android.feature.CONTEXTUAL_SEARCH\" />\n    <feature name=\"com.google.android.feature.GEMINI_EXPERIENCE\" />\n    <!--                                      -->\n"
+
+[[op]]
+kind = "text_replace"
+partition = "product"
+file = "etc/sysconfig/google.xml"
+from = "    <!-- These are the standard packages that are white-listed to always have internet\n         access while in power save mode, even if they aren't in the foreground. -->\n"
+to = "    <feature name=\"com.google.android.feature.CONTEXTUAL_SEARCH_LIVE_TRANSLATE\" />\n    <!--                                                                             -->\n"

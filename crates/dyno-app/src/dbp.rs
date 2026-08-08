@@ -2817,10 +2817,11 @@ value = false
         let cts = load_dbp(&patches_dir().join("enable-circle-to-search.dbp"))
             .expect("enable-circle-to-search.dbp");
         assert_eq!(cts.name, "enable-circle-to-search");
-        assert_eq!(cts.ops.len(), 3);
+        assert_eq!(cts.ops.len(), 4);
         let mut sysui = false;
         let mut settings = false;
-        let mut features = false;
+        let mut declared = String::new();
+        let mut text_ops = 0usize;
         for op in &cts.ops {
             match op {
                 DbpOp::InvokeConstBool {
@@ -2858,16 +2859,24 @@ value = false
                         to.len(),
                         "google.xml swap must be size-preserving"
                     );
-                    assert!(to.contains("CONTEXTUAL_SEARCH") && to.contains("GEMINI_EXPERIENCE"));
-                    features = true;
+                    declared.push_str(to);
+                    text_ops += 1;
                 }
                 _ => panic!("unexpected op in enable-circle-to-search"),
             }
         }
-        assert!(
-            sysui && settings && features,
-            "all three CtS ops must parse"
-        );
+        assert_eq!(text_ops, 2, "google.xml feature swaps");
+        for feature in [
+            "com.google.android.feature.CONTEXTUAL_SEARCH\"",
+            "com.google.android.feature.GEMINI_EXPERIENCE\"",
+            "com.google.android.feature.CONTEXTUAL_SEARCH_LIVE_TRANSLATE\"",
+        ] {
+            assert!(
+                declared.contains(feature),
+                "google.xml must declare {feature}"
+            );
+        }
+        assert!(sysui && settings, "both CtS dex ops must parse");
 
         let pgs = load_dbp(&patches_dir().join("show-power-gesture.dbp"))
             .expect("show-power-gesture.dbp");
