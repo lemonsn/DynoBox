@@ -395,7 +395,7 @@ impl PipelineOps for RealPipelineOps {
         message(
             events,
             MessageLevel::Info,
-            "Hashing final output for dynobox-manifest.json...".to_string(),
+            "Hashing output for dynobox-manifest.json.".to_string(),
         );
         let manifest = crate::integrity::write_output_manifest_for_dir_with_input_artifacts(
             output_dir,
@@ -414,15 +414,14 @@ impl PipelineOps for RealPipelineOps {
             message(
                 events,
                 MessageLevel::Info,
-                "Excluded root abl.elf from dynobox-manifest.json because the pipeline included resign."
-                    .to_string(),
+                "Manifest excludes root abl.elf after resign.".to_string(),
             );
         }
         message(
             events,
             MessageLevel::Info,
             format!(
-                "Wrote dynobox-manifest.json with {} original input image digest(s) and {} output artifact digest(s).",
+                "Manifest: {} input image digest(s), {} output artifact digest(s).",
                 manifest.input_artifacts.len(),
                 manifest.artifacts.len()
             ),
@@ -470,7 +469,7 @@ fn capture_original_input_artifacts(
         events,
         MessageLevel::Info,
         format!(
-            "Captured {} SHA-256 digest(s) from original input image(s).",
+            "Captured {} input image SHA-256 digest(s).",
             artifacts.len()
         ),
     );
@@ -522,7 +521,7 @@ where
         events,
         MessageLevel::Info,
         format!(
-            "Prepared unpack workspace using {} hardlink(s) and {} copy/copies.",
+            "Unpack workspace: {} hardlink(s), {} copy/copies.",
             prep_stats.hard_links, prep_stats.copies
         ),
     );
@@ -740,7 +739,7 @@ where
                         events,
                         MessageLevel::Warning,
                         format!(
-                            "Failed to write pipeline report to {}: {e} (close any open viewer of report.html and re-run if you need it in the final output)",
+                            "Could not write report to `{}`: {e}. Close any open report viewer and retry.",
                             dst.display()
                         ),
                     );
@@ -749,7 +748,7 @@ where
             Err(e) => message(
                 events,
                 MessageLevel::Warning,
-                format!("Failed to read pipeline report at {}: {e}", src.display()),
+                format!("Could not read report at `{}`: {e}", src.display()),
             ),
         }
     }
@@ -766,10 +765,7 @@ where
                 message(
                     events,
                     MessageLevel::Warning,
-                    format!(
-                        "Failed to read retained pipeline input at {}: {e}",
-                        src.display()
-                    ),
+                    format!("Could not read retained input at `{}`: {e}", src.display()),
                 );
                 continue;
             }
@@ -778,7 +774,7 @@ where
             message(
                 events,
                 MessageLevel::Warning,
-                format!("Failed to retain pipeline input at {}: {e}", dst.display()),
+                format!("Could not retain input at `{}`: {e}", dst.display()),
             );
         }
     }
@@ -998,7 +994,7 @@ where
                 events,
                 MessageLevel::Info,
                 format!(
-                    "Preflight OK for {}: {} partitions, {} operations.",
+                    "Preflight `{}`: {} partitions, {} operations.",
                     zip_path.display(),
                     report.partition_count,
                     report.total_operations
@@ -1007,7 +1003,7 @@ where
         } else {
             for unsupported in report.unsupported_operations {
                 unsupported_messages.push(format!(
-                    "{} :: {} op #{} {} :: {}",
+                    "`{}` :: {} op #{} {} :: {}",
                     zip_path.display(),
                     unsupported.partition_name,
                     unsupported.operation_index,
@@ -1031,7 +1027,7 @@ where
         events,
         MessageLevel::Info,
         format!(
-            "Preflight summary: {} OTA zip(s), {} partitions, {} operations [{}].",
+            "Preflight: {} OTA zip(s), {} partitions, {} operations [{}].",
             ota_zips.len(),
             total_partitions,
             total_operations,
@@ -1101,7 +1097,7 @@ where
     message(
         events,
         MessageLevel::Info,
-        format!("Unpack complete. Extracted {} images.", extracted.len()),
+        format!("Unpacked {} images.", extracted.len()),
     );
 
     events.emit(ProgressEvent::StageCompleted {
@@ -1254,7 +1250,7 @@ where
                 events,
                 MessageLevel::Info,
                 format!(
-                    "`--unpack` requested. Pre-unpacking {} dynamic partitions from super into {}.",
+                    "`--unpack`: extracting {} dynamic partitions to `{}`.",
                     layout.dynamic_partition_names().len(),
                     auto_unpack_dir.display()
                 ),
@@ -1275,7 +1271,7 @@ where
             message(
                 events,
                 MessageLevel::Info,
-                format!("Pre-unpack complete. Extracted {} images.", extracted.len()),
+                format!("`--unpack`: extracted {} images.", extracted.len()),
             );
             events.emit(ProgressEvent::StageCompleted {
                 stage: StageKind::AutoUnpack,
@@ -1295,7 +1291,7 @@ where
                     events,
                     MessageLevel::Info,
                     format!(
-                        "Input is missing {} standalone dynamic partition images. Apply will auto-unpack required partitions from super.",
+                        "{} dynamic partition image(s) missing; apply will extract them from super.",
                         missing_dynamic_count
                     ),
                 );
@@ -1305,8 +1301,7 @@ where
         message(
             events,
             MessageLevel::Warning,
-            "`--unpack` requested, but no super layout found. Continuing without forced unpack."
-                .to_string(),
+            "`--unpack`: no super layout; continuing without forced unpack.".to_string(),
         );
     }
 
@@ -1315,7 +1310,7 @@ where
             events,
             MessageLevel::Info,
             format!(
-                "Processing OTA zip {}/{}: {}",
+                "OTA {}/{}: `{}`",
                 zip_index + 1,
                 ota_zips.len(),
                 zip_path.display()
@@ -1330,7 +1325,7 @@ where
             events,
             MessageLevel::Info,
             format!(
-                "Payload version: {}, blocks: {}, partitions: {}",
+                "Payload: version {}, block size {}, {} partition(s)",
                 metadata.version,
                 metadata.block_size,
                 metadata.partitions.len()
@@ -1366,7 +1361,7 @@ where
                         events,
                         MessageLevel::Info,
                         format!(
-                            "Reconstructing split source for {} from {} fragment(s).",
+                            "Split source {}: reconstructing {} fragment(s).",
                             p_info.name,
                             split_fragments.len()
                         ),
@@ -1469,7 +1464,7 @@ where
                                 events,
                                 MessageLevel::Info,
                                 format!(
-                                    "Packed super input detected. Auto-unpacking dynamic partitions from super into {}.",
+                                    "Packed super detected; extracting dynamic partitions to `{}`.",
                                     auto_unpack_dir.display()
                                 ),
                             );
@@ -2080,7 +2075,7 @@ where
         message(
             events,
             MessageLevel::Warning,
-            "--debloat: no supported ext4 partitions found in output; nothing to do.".to_string(),
+            "--debloat: no supported ext4 partitions; skipped.".to_string(),
         );
         return Ok(());
     }
@@ -2093,7 +2088,7 @@ where
         events,
         MessageLevel::Info,
         format!(
-            "--debloat: wrote {} ({} path(s) across {} partition(s)).",
+            "--debloat: wrote `{}` ({} path(s), {} partition(s)).",
             blobs_path.display(),
             blob_lines.len(),
             scanned
@@ -2135,7 +2130,7 @@ where
                 message(
                     events,
                     MessageLevel::Info,
-                    "--debloat: stdin is not a terminal; using debloat.txt as-is.".to_string(),
+                    "--debloat: non-interactive; using debloat.txt as-is.".to_string(),
                 );
             }
             std::fs::read_to_string(&debloat_path).unwrap_or_default()
@@ -2155,7 +2150,7 @@ where
             message(
                 events,
                 MessageLevel::Warning,
-                format!("--debloat: ignoring malformed line (need partition:/path): {line}"),
+                format!("--debloat: malformed `{line}`; expected partition:/path."),
             );
             continue;
         };
@@ -2174,7 +2169,7 @@ where
         message(
             events,
             MessageLevel::Info,
-            "--debloat: debloat.txt has no entries; nothing removed.".to_string(),
+            "--debloat: debloat.txt has no valid entries; nothing removed.".to_string(),
         );
         return Ok(());
     }
@@ -2189,9 +2184,7 @@ where
             message(
                 events,
                 MessageLevel::Warning,
-                format!(
-                    "--debloat: `{stem}` is not a scanned partition in the output; skipping its entries."
-                ),
+                format!("--debloat: partition `{stem}` was not scanned; skipped its entries."),
             );
             continue;
         }
@@ -2201,7 +2194,7 @@ where
             message(
                 events,
                 MessageLevel::Warning,
-                format!("--debloat: no such partition image `{img_name}`; skipping its entries."),
+                format!("--debloat: `{img_name}` not found; skipped its entries."),
             );
             continue;
         }
@@ -2218,7 +2211,7 @@ where
                     message(
                         events,
                         MessageLevel::Warning,
-                        format!("--debloat: {stem}:{path} not found; ignored."),
+                        format!("--debloat: {stem}:{path} not found; skipped."),
                     );
                 }
             }
@@ -2226,7 +2219,7 @@ where
         message(
             events,
             MessageLevel::Info,
-            format!("--debloat: {stem}: hid {removed} path(s), ignored {not_found}."),
+            format!("--debloat: {stem}: hid {removed} path(s), missing {not_found}."),
         );
         if removed == 0 {
             continue;
@@ -2352,7 +2345,7 @@ where
                 message(
                     events,
                     MessageLevel::Warning,
-                    "rollback index reset declined by user; continuing without rollback override (all resignable images will be re-signed normally).".to_string(),
+                    "Rollback reset declined; re-signing without rollback override.".to_string(),
                 );
                 effective_rollback = None;
                 images = all_images;
@@ -2369,7 +2362,8 @@ where
                 message(
                     events,
                     MessageLevel::Warning,
-                    "rollback index reset skipped because stdin is not a terminal (cannot prompt); continuing without rollback override.".to_string(),
+                    "Rollback reset needs a terminal prompt; re-signing without override."
+                        .to_string(),
                 );
                 effective_rollback = None;
                 images = all_images;
@@ -2426,7 +2420,7 @@ where
                     events,
                     MessageLevel::Info,
                     format!(
-                        "vendor.img {} bumped from {} to {} (build.prop + AVB property; verity deferred)",
+                        "vendor.img {}: {} -> {} (build.prop + AVB; verity deferred)",
                         VENDOR_SPL_PROPERTY, old, new
                     ),
                 );
@@ -2445,7 +2439,7 @@ where
                     events,
                     MessageLevel::Warning,
                     format!(
-                        "vendor.img {} not bumped: requested {} is not newer than current {}; re-signing without SPL change",
+                        "vendor.img SPL unchanged ({}): requested {} is not newer than current {}; image still re-signed.",
                         VENDOR_SPL_PROPERTY, requested, old
                     ),
                 );
@@ -2510,7 +2504,7 @@ where
                     events,
                     MessageLevel::Info,
                     format!(
-                        "system.img {} bumped from {} to {} (build.prop + AVB property; verity deferred)",
+                        "system.img {}: {} -> {} (build.prop + AVB; verity deferred)",
                         SYSTEM_SPL_PROPERTY, old, new
                     ),
                 );
@@ -2529,7 +2523,7 @@ where
                     events,
                     MessageLevel::Warning,
                     format!(
-                        "system.img {} not bumped: requested {} is not newer than current {}; re-signing without SPL change",
+                        "system.img SPL unchanged ({}): requested {} is not newer than current {}; image still re-signed.",
                         SYSTEM_SPL_PROPERTY, requested, old
                     ),
                 );
@@ -2606,7 +2600,7 @@ where
                         events,
                         MessageLevel::Info,
                         format!(
-                            "[lgsi] {name}: {from} -> {to} (jar invoke-direct offset {invoke_direct_offset_in_jar:#x})"
+                            "[lgsi] {name}: {from} -> {to} (invoke-direct offset {invoke_direct_offset_in_jar:#x})"
                         ),
                     );
                 }
@@ -2622,7 +2616,7 @@ where
                     events,
                     MessageLevel::Info,
                     format!(
-                        "system.img LGSI patch applied: {} feature(s) flipped (verity deferred)",
+                        "LGSI: flipped {} feature(s) in system.img (verity deferred)",
                         applied.len(),
                     ),
                 );
@@ -2712,10 +2706,7 @@ where
                     message(
                         events,
                         MessageLevel::Warning,
-                        format!(
-                            "--plus {source}: partition image {img_name} not found under {}; skipping its ops",
-                            out_dir.display()
-                        ),
+                        format!("--plus {source}: {img_name} not found; skipped its ops"),
                     );
                     continue;
                 }
@@ -2736,7 +2727,7 @@ where
                             events,
                             MessageLevel::Warning,
                             format!(
-                                "--plus {source}: target {partition}:{} not found; skipping {} op(s)",
+                                "--plus {source}: target {partition}:{} not found; skipped {} op(s)",
                                 r.file, r.ops_skipped
                             ),
                         );
@@ -2748,7 +2739,7 @@ where
                             events,
                             MessageLevel::Warning,
                             format!(
-                                "--plus {source}: target {partition}:{} exists, but all {} op(s) missed their exact sites (already patched or incompatible firmware)",
+                                "--plus {source}: target {partition}:{} matched no exact sites for {} op(s) (already patched or incompatible firmware)",
                                 r.file, r.ops_skipped
                             ),
                         );
@@ -2962,10 +2953,7 @@ where
                     message(
                         events,
                         MessageLevel::Info,
-                        format!(
-                            "boot.img {} bumped from {} to {}",
-                            BOOT_SPL_PROPERTY, old, new
-                        ),
+                        format!("boot.img {}: {} -> {}", BOOT_SPL_PROPERTY, old, new),
                     );
                     report.boot_spl = Some(ReportSplRecord {
                         property: BOOT_SPL_PROPERTY.to_string(),
@@ -2981,7 +2969,7 @@ where
                         events,
                         MessageLevel::Warning,
                         format!(
-                            "boot.img {} not bumped: requested {} is not newer than current {}; re-signed without SPL change",
+                            "boot.img SPL unchanged ({}): requested {} is not newer than current {}; image still re-signed.",
                             BOOT_SPL_PROPERTY, requested, old
                         ),
                     );
@@ -3104,7 +3092,7 @@ where
             events,
             MessageLevel::Info,
             format!(
-                "Resign complete. Re-signed {} images, skipped {} unsigned AVB images.",
+                "Resigned {} image(s); skipped {} unsigned AVB image(s).",
                 resigned_count, skipped_unsigned_count
             ),
         );
@@ -3119,7 +3107,7 @@ where
             events,
             MessageLevel::Warning,
             format!(
-                "Resign substituted signing key: {} -> {}. The bootloader typically only verifies signatures against the keys it was built with — the final output may need to ship together with an abl.elf build that accepts the new signing key, otherwise the device will refuse to boot.",
+                "Signing key changed: {} -> {}. Flash an abl.elf that accepts the new key or the device may not boot.",
                 orig, new
             ),
         );
@@ -3142,7 +3130,7 @@ where
                 events,
                 MessageLevel::Warning,
                 format!(
-                    "Failed to write pipeline report to {}: {e}; resign stage continues",
+                    "Could not write report to `{}`: {e}; resign continues",
                     report_path.display()
                 ),
             );
@@ -3150,7 +3138,7 @@ where
             message(
                 events,
                 MessageLevel::Info,
-                format!("Pipeline report written to {}", report_path.display()),
+                format!("Report: `{}`", report_path.display()),
             );
         }
     }
@@ -3342,7 +3330,7 @@ where
         events,
         MessageLevel::Info,
         format!(
-            "Prepare repack staged {} rawprogram XML(s), {} super chunk(s), {} image(s) using {} hardlink(s) and {} copy/copies.",
+            "Repack staging: {} rawprogram XML(s), {} super chunk(s), {} image(s); {} hardlink(s), {} copy/copies.",
             prep_stats.xml_count,
             prep_stats.super_count,
             prep_stats.image_count,
@@ -3360,7 +3348,7 @@ where
         events,
         MessageLevel::Info,
         format!(
-            "Final output image materialization used {} hardlink(s) and {} copy/copies.",
+            "Final images: {} hardlink(s), {} copy/copies.",
             final_copy_stats.hard_links, final_copy_stats.copies
         ),
     );
@@ -3382,7 +3370,7 @@ where
                 events,
                 MessageLevel::Info,
                 format!(
-                    "Cleaned up {} standalone dynamic partition image(s) from output (now inside super).",
+                    "Removed {} standalone dynamic image(s) now packed in super.",
                     removed
                 ),
             );
@@ -3913,10 +3901,7 @@ where
         message(
             events,
             MessageLevel::Info,
-            format!(
-                "--complete: copied {} additional file(s) from input to output.",
-                copied
-            ),
+            format!("--complete: copied {} additional input file(s).", copied),
         );
     }
     Ok(())

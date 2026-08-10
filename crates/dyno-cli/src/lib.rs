@@ -11,6 +11,7 @@ use dynobox_app::{
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -614,6 +615,277 @@ fn stage_name(stage: StageKind) -> &'static str {
     }
 }
 
+/// Text-renderer-only path state. JSONL receives the original event before
+/// this sink-local transformation.
+#[derive(Default)]
+struct TextPathShortener {
+    roots: Vec<String>,
+}
+
+impl TextPathShortener {
+    fn shorten_event(&mut self, event: ProgressEvent) -> ProgressEvent {
+        match event {
+            ProgressEvent::CommandStarted {
+                command,
+                input,
+                output,
+            } => {
+                self.roots.clear();
+                self.remember_root(&input);
+                self.remember_root(&output);
+                ProgressEvent::CommandStarted {
+                    command,
+                    input,
+                    output,
+                }
+            }
+            ProgressEvent::ItemStarted {
+                stage,
+                current,
+                total,
+                item,
+            } => ProgressEvent::ItemStarted {
+                stage,
+                current,
+                total,
+                item: self.shorten_text(&item).into_owned(),
+            },
+            ProgressEvent::ItemProgress {
+                stage,
+                item,
+                done,
+                total,
+                unit,
+            } => ProgressEvent::ItemProgress {
+                stage,
+                item: self.shorten_text(&item).into_owned(),
+                done,
+                total,
+                unit,
+            },
+            ProgressEvent::Message { level, text } => ProgressEvent::Message {
+                level,
+                text: self.shorten_text(&text).into_owned(),
+            },
+            other => other,
+        }
+    }
+
+    fn remember_root(&mut self, path: &Path) {
+        let root = path.display().to_string();
+        let root = root.trim_end_matches(['/', '\\']);
+        if !root.is_empty() && !self.roots.iter().any(|known| known == root) {
+            self.roots.push(root.to_string());
+            self.roots
+                .sort_by_key(|known| std::cmp::Reverse(known.len()));
+        }
+    }
+
+    fn shorten_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let mut rendered = String::with_capacity(text.len());
+        let mut copied_through = 0;
+        let mut scan = 0;
+
+        while scan < text.len() {
+            if let Some(span) = self.path_span_at(text, scan) {
+                let path = &text[span.path_start..span.path_end];
+                if let Some(name) = display_name(path)
+                    && name != path
+                {
+                    rendered.push_str(&text[copied_through..span.path_start]);
+                    rendered.push_str(name);
+                    copied_through = span.path_end;
+                    scan = span.scan_end;
+                    continue;
+                }
+            }
+
+            scan += text[scan..]
+                .chars()
+                .next()
+                .expect("scan is within the string")
+                .len_utf8();
+        }
+
+        if copied_through == 0 {
+            Cow::Borrowed(text)
+        } else {
+            rendered.push_str(&text[copied_through..]);
+            Cow::Owned(rendered)
+        }
+    }
+
+    fn path_span_at(&self, text: &str, start: usize) -> Option<PathSpan> {
+        if !is_path_boundary_before(text, start) {
+            return None;
+        }
+
+        let first = text[start..].chars().next()?;
+        if matches!(first, '"' | '\'' | '`') {
+            let content_start = start + first.len_utf8();
+            if let Some(relative_close) = text[content_start..].find(first) {
+                let content_end = content_start + relative_close;
+                let path_end = trim_path_end(text, content_start, content_end);
+                let raw = &text[content_start..content_end];
+                let path = &text[content_start..path_end];
+                if is_path_candidate(path, raw) || self.is_root_anchored_candidate(path, raw) {
+                    return Some(PathSpan {
+                        path_start: content_start,
+                        path_end,
+                        scan_end: content_end + first.len_utf8(),
+                    });
+                }
+            }
+        }
+
+        for root in &self.roots {
+            if !text[start..].starts_with(root) {
+                continue;
+            }
+            let root_end = start + root.len();
+            let next = text[root_end..].chars().next();
+            if next.is_some_and(|ch| !is_path_separator(ch) && !is_path_terminator(ch)) {
+                continue;
+            }
+
+            let scan_end = if next.is_some_and(is_path_separator) {
+                token_end(text, root_end)
+            } else {
+                root_end
+            };
+            let path_end = trim_path_end(text, start, scan_end);
+            let raw = &text[start..scan_end];
+            let path = &text[start..path_end];
+            if is_excluded_path_syntax(path, raw)
+                || display_name(path).is_none_or(|name| name == path)
+            {
+                continue;
+            }
+            return Some(PathSpan {
+                path_start: start,
+                path_end,
+                scan_end,
+            });
+        }
+
+        let scan_end = token_end(text, start);
+        let token = &text[start..scan_end];
+        let path = token.trim_start_matches(['(', '[', '{', '<']);
+        let path_start = scan_end - token.len() + (token.len() - path.len());
+        let path_end = trim_path_end(text, path_start, scan_end);
+        let raw = token;
+        let path = &text[path_start..path_end];
+        is_path_candidate(path, raw).then_some(PathSpan {
+            path_start,
+            path_end,
+            scan_end,
+        })
+    }
+
+    fn is_root_anchored_candidate(&self, path: &str, raw: &str) -> bool {
+        !is_excluded_path_syntax(path, raw)
+            && self.roots.iter().any(|root| {
+                path.strip_prefix(root)
+                    .is_some_and(|suffix| suffix.chars().next().is_some_and(is_path_separator))
+            })
+            && display_name(path).is_some_and(|name| name != path)
+    }
+}
+
+struct PathSpan {
+    path_start: usize,
+    path_end: usize,
+    scan_end: usize,
+}
+
+fn token_end(text: &str, start: usize) -> usize {
+    start
+        + text[start..]
+            .find(char::is_whitespace)
+            .unwrap_or(text.len() - start)
+}
+
+fn trim_path_end(text: &str, start: usize, mut end: usize) -> usize {
+    while end > start
+        && text[..end]
+            .chars()
+            .next_back()
+            .is_some_and(is_path_terminator)
+    {
+        end -= text[..end]
+            .chars()
+            .next_back()
+            .expect("path end has a preceding character")
+            .len_utf8();
+    }
+    end
+}
+
+fn is_path_candidate(path: &str, raw: &str) -> bool {
+    if is_excluded_path_syntax(path, raw) {
+        return false;
+    }
+
+    let bytes = path.as_bytes();
+    let windows_drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    let windows_unc = path.starts_with(r"\\");
+    let posix_absolute = path.starts_with('/') && !path.starts_with("//");
+
+    (windows_drive || windows_unc || posix_absolute)
+        && display_name(path).is_some_and(|name| name != path)
+}
+
+fn is_excluded_path_syntax(path: &str, raw: &str) -> bool {
+    path.is_empty()
+        || path.contains("://")
+        || path.starts_with("//")
+        || path.contains('=')
+        || is_dex_or_jvm_identifier(raw)
+}
+
+fn is_dex_or_jvm_identifier(raw: &str) -> bool {
+    raw.char_indices().any(|(start, ch)| {
+        if ch != 'L' {
+            return false;
+        }
+
+        let descriptor = &raw[start + ch.len_utf8()..];
+        descriptor
+            .find(';')
+            .is_some_and(|end| descriptor[..end].contains('/'))
+    })
+}
+
+fn display_name(path: &str) -> Option<&str> {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
+fn is_path_separator(ch: char) -> bool {
+    matches!(ch, '/' | '\\')
+}
+
+fn is_path_terminator(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '.' | ',' | ';' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\'' | '`'
+        )
+}
+
+fn is_path_boundary_before(text: &str, index: usize) -> bool {
+    index == 0
+        || text[..index].chars().next_back().is_some_and(|ch| {
+            ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '(' | '[' | '{' | '<')
+        })
+}
+
 fn log_event(event: ProgressEvent) {
     match event {
         ProgressEvent::CommandStarted {
@@ -697,46 +969,49 @@ fn build_text_sink() -> impl FnMut(ProgressEvent) {
     let mut active_bar: Option<ProgressBar> = None;
     let mut active_item: Option<String> = None;
     let mut bar_is_determinate = false;
+    let mut path_shortener = TextPathShortener::default();
 
-    move |event: ProgressEvent| match &event {
-        ProgressEvent::ItemProgress {
-            item,
-            done,
-            total,
-            unit,
-            ..
-        } => {
-            if !interactive {
-                return;
-            }
-            let total = *total;
-            let done = *done;
-            let unit_str = unit_label(*unit);
-
-            let upgrade = !bar_is_determinate || active_item.as_deref() != Some(item.as_str());
-            if upgrade {
-                if let Some(pb) = active_bar.take() {
-                    pb.finish_and_clear();
+    move |event: ProgressEvent| {
+        let event = path_shortener.shorten_event(event);
+        match &event {
+            ProgressEvent::ItemProgress {
+                item,
+                done,
+                total,
+                unit,
+                ..
+            } => {
+                if !interactive {
+                    return;
                 }
-                let pb = if total == 0 {
-                    let pb = ProgressBar::new_spinner();
-                    pb.set_style(
-                        ProgressStyle::with_template("    {spinner:.cyan} {msg} ({elapsed})")
-                            .expect("static spinner template parses")
-                            .tick_strings(SPINNER_TICK_FRAMES),
-                    );
-                    pb.enable_steady_tick(Duration::from_millis(120));
-                    pb
-                } else {
-                    // For Bytes-flavored progress (the OTA apply weighted-bytes
-                    // metric is bytes-like even though it mixes data_length
-                    // with a fraction of dst_bytes), use indicatif's
-                    // `{decimal_bytes}/{decimal_total_bytes}` formatter so the
-                    // numbers render as `120 MB / 1.4 GB` rather than the raw
-                    // 12-digit integers a `{pos}/{len}` template would print.
-                    // Other units fall back to plain integer counts with the
-                    // unit label appended.
-                    let template = match unit {
+                let total = *total;
+                let done = *done;
+                let unit_str = unit_label(*unit);
+
+                let upgrade = !bar_is_determinate || active_item.as_deref() != Some(item.as_str());
+                if upgrade {
+                    if let Some(pb) = active_bar.take() {
+                        pb.finish_and_clear();
+                    }
+                    let pb = if total == 0 {
+                        let pb = ProgressBar::new_spinner();
+                        pb.set_style(
+                            ProgressStyle::with_template("    {spinner:.cyan} {msg} ({elapsed})")
+                                .expect("static spinner template parses")
+                                .tick_strings(SPINNER_TICK_FRAMES),
+                        );
+                        pb.enable_steady_tick(Duration::from_millis(120));
+                        pb
+                    } else {
+                        // For Bytes-flavored progress (the OTA apply weighted-bytes
+                        // metric is bytes-like even though it mixes data_length
+                        // with a fraction of dst_bytes), use indicatif's
+                        // `{decimal_bytes}/{decimal_total_bytes}` formatter so the
+                        // numbers render as `120 MB / 1.4 GB` rather than the raw
+                        // 12-digit integers a `{pos}/{len}` template would print.
+                        // Other units fall back to plain integer counts with the
+                        // unit label appended.
+                        let template = match unit {
                         ProgressUnit::Bytes => {
                             "    {spinner:.cyan} {msg} [{wide_bar:.cyan/blue}] {decimal_bytes}/{decimal_total_bytes} ({elapsed}, ETA {eta})".to_string()
                         }
@@ -745,53 +1020,54 @@ fn build_text_sink() -> impl FnMut(ProgressEvent) {
                             unit_str
                         ),
                     };
-                    let pb = ProgressBar::new(total);
-                    let style = ProgressStyle::with_template(&template)
-                        .expect("dynamic bar template parses")
-                        .tick_strings(SPINNER_TICK_FRAMES)
-                        .progress_chars("##-");
-                    pb.set_style(style);
-                    pb.enable_steady_tick(Duration::from_millis(200));
-                    pb
-                };
-                pb.set_message(item.clone());
-                active_bar = Some(pb);
-                active_item = Some(item.clone());
-                bar_is_determinate = total > 0;
-            }
-            if let Some(pb) = active_bar.as_ref() {
-                if total > 0 {
-                    pb.set_length(total);
-                    pb.set_position(done);
+                        let pb = ProgressBar::new(total);
+                        let style = ProgressStyle::with_template(&template)
+                            .expect("dynamic bar template parses")
+                            .tick_strings(SPINNER_TICK_FRAMES)
+                            .progress_chars("##-");
+                        pb.set_style(style);
+                        pb.enable_steady_tick(Duration::from_millis(200));
+                        pb
+                    };
+                    pb.set_message(item.clone());
+                    active_bar = Some(pb);
+                    active_item = Some(item.clone());
+                    bar_is_determinate = total > 0;
+                }
+                if let Some(pb) = active_bar.as_ref() {
+                    if total > 0 {
+                        pb.set_length(total);
+                        pb.set_position(done);
+                    }
                 }
             }
-        }
-        other => {
-            if let Some(pb) = active_bar.take() {
-                pb.finish_and_clear();
-            }
-            bar_is_determinate = false;
-            active_item = None;
-            let starts_work = matches!(
-                other,
-                ProgressEvent::ItemStarted { .. } | ProgressEvent::StageStarted { .. }
-            );
-            let item_label = match other {
-                ProgressEvent::ItemStarted { item, .. } => Some(item.clone()),
-                _ => None,
-            };
-            log_event(event);
-            if interactive && starts_work {
-                let pb = ProgressBar::new_spinner();
-                pb.set_style(
-                    ProgressStyle::with_template("    {spinner:.cyan} {msg} ({elapsed})")
-                        .expect("static spinner template parses")
-                        .tick_strings(SPINNER_TICK_FRAMES),
+            other => {
+                if let Some(pb) = active_bar.take() {
+                    pb.finish_and_clear();
+                }
+                bar_is_determinate = false;
+                active_item = None;
+                let starts_work = matches!(
+                    other,
+                    ProgressEvent::ItemStarted { .. } | ProgressEvent::StageStarted { .. }
                 );
-                pb.set_message(item_label.clone().unwrap_or_else(|| "working…".into()));
-                pb.enable_steady_tick(Duration::from_millis(120));
-                active_bar = Some(pb);
-                active_item = item_label;
+                let item_label = match other {
+                    ProgressEvent::ItemStarted { item, .. } => Some(item.clone()),
+                    _ => None,
+                };
+                log_event(event);
+                if interactive && starts_work {
+                    let pb = ProgressBar::new_spinner();
+                    pb.set_style(
+                        ProgressStyle::with_template("    {spinner:.cyan} {msg} ({elapsed})")
+                            .expect("static spinner template parses")
+                            .tick_strings(SPINNER_TICK_FRAMES),
+                    );
+                    pb.set_message(item_label.clone().unwrap_or_else(|| "working…".into()));
+                    pb.enable_steady_tick(Duration::from_millis(120));
+                    active_bar = Some(pb);
+                    active_item = item_label;
+                }
             }
         }
     }
@@ -1091,9 +1367,10 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        ApplyResignOptions, Cli, Commands, default_public_key_path, parse_apply_positional_args,
-        validate_apply_resign_options,
+        ApplyResignOptions, Cli, Commands, TextPathShortener, default_public_key_path,
+        parse_apply_positional_args, validate_apply_resign_options,
     };
+    use dynobox_app::{CommandKind, MessageLevel, ProgressEvent, StageKind};
     use std::path::PathBuf;
 
     #[test]
@@ -1135,6 +1412,174 @@ mod tests {
                 ..
             } if trusted_integrity_key.len() == 2
         ));
+    }
+
+    #[test]
+    fn text_path_shortener_keeps_command_paths_and_shortens_windows_items() {
+        let mut shortener = TextPathShortener::default();
+        let started = ProgressEvent::CommandStarted {
+            command: CommandKind::Resign,
+            input: PathBuf::from(r"D:\Git\DynoBox\firmware\image"),
+            output: PathBuf::from(r"D:\Git\DynoBox\output"),
+        };
+        assert_eq!(shortener.shorten_event(started.clone()), started);
+
+        let item = ProgressEvent::ItemStarted {
+            stage: StageKind::Resign,
+            current: 1,
+            total: 1,
+            item: r"D:\Git\DynoBox\output\boot.img".to_string(),
+        };
+        assert!(matches!(
+            shortener.shorten_event(item),
+            ProgressEvent::ItemStarted { item, .. } if item == "boot.img"
+        ));
+    }
+
+    #[test]
+    fn text_path_shortener_shortens_posix_path_embedded_in_message() {
+        let shortener = TextPathShortener::default();
+        assert_eq!(
+            shortener.shorten_text("Report written to /tmp/dynobox-stage/report.html."),
+            "Report written to report.html."
+        );
+    }
+
+    #[test]
+    fn text_path_shortener_shortens_multiple_paths() {
+        let shortener = TextPathShortener::default();
+        assert_eq!(
+            shortener.shorten_text(r"Copied D:\work\input\boot.img to /tmp/output/boot.img."),
+            "Copied boot.img to boot.img."
+        );
+    }
+
+    #[test]
+    fn text_path_shortener_shortens_delimited_path_with_spaces() {
+        let shortener = TextPathShortener::default();
+        assert_eq!(
+            shortener.shorten_text(
+                r"Preflight `D:\Firmware Files\OTA Builds\update 117.zip`: 4 partitions."
+            ),
+            "Preflight `update 117.zip`: 4 partitions."
+        );
+    }
+
+    #[test]
+    fn text_path_shortener_leaves_non_path_text_unchanged() {
+        let shortener = TextPathShortener::default();
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let text = format!(
+            "Keep system:/system/app/Foo.apk, version 1.5.10.063, {digest}, https://example.com/a/b, ro.product.config=/system/etc/build.prop, and Lcom/lenovo/settings/privacy/UserExperienceSwitchController;."
+        );
+        assert_eq!(shortener.shorten_text(&text), text);
+    }
+
+    #[test]
+    fn text_path_shortener_handles_anchored_root_with_spaces() {
+        let mut shortener = TextPathShortener::default();
+        let _ = shortener.shorten_event(ProgressEvent::CommandStarted {
+            command: CommandKind::Apply,
+            input: PathBuf::from(r"D:\Firmware Images\image"),
+            output: PathBuf::from(r"D:\DynoBox Output\final"),
+        });
+        let event = ProgressEvent::Message {
+            level: MessageLevel::Info,
+            text: r"Staged D:\DynoBox Output\final\report.html.".to_string(),
+        };
+        assert!(matches!(
+            shortener.shorten_event(event),
+            ProgressEvent::Message { text, .. } if text == "Staged report.html."
+        ));
+    }
+
+    #[test]
+    fn text_path_shortener_uses_final_component_for_remembered_relative_roots() {
+        let mut shortener = TextPathShortener::default();
+        let _ = shortener.shorten_event(ProgressEvent::CommandStarted {
+            command: CommandKind::Apply,
+            input: PathBuf::from("patches"),
+            output: PathBuf::from("output"),
+        });
+
+        assert_eq!(
+            shortener.shorten_text("Staged output/stage/report.html."),
+            "Staged report.html."
+        );
+        assert_eq!(
+            shortener.shorten_text("Loaded patches/vendor/update.dbp."),
+            "Loaded update.dbp."
+        );
+        assert_eq!(
+            shortener.shorten_text(r#"Saved `output/stage/report final.html`."#),
+            r#"Saved `report final.html`."#
+        );
+    }
+
+    #[test]
+    fn text_path_shortener_leaves_live_slash_separated_prose_unchanged() {
+        let shortener = TextPathShortener::default();
+        let verification = "Semantic verification: ACCEPTED from trusted signed manifest (local AVB/XML/super skipped)";
+        let unpack = "Unpack workspace: 12 hardlink(s), 3 copy/copies.";
+
+        assert_eq!(shortener.shorten_text(verification), verification);
+        assert_eq!(shortener.shorten_text(unpack), unpack);
+    }
+
+    #[test]
+    fn text_path_shortener_leaves_unanchored_relative_tokens_unchanged() {
+        let shortener = TextPathShortener::default();
+        let text = "Answer y/N and preserve and/or in this sentence.";
+        assert_eq!(shortener.shorten_text(text), text);
+
+        let quoted = r#"Loaded "patches/vendor/update.dbp"."#;
+        assert_eq!(shortener.shorten_text(quoted), quoted);
+    }
+
+    #[test]
+    fn text_path_shortener_leaves_dex_and_jvm_identifiers_unchanged() {
+        let shortener = TextPathShortener::default();
+        let prototype = "(Landroid/content/Context;)Z";
+        let method = "Lcom/zui/setupwizard/Foo;->initView()V";
+
+        assert_eq!(shortener.shorten_text(prototype), prototype);
+        assert_eq!(shortener.shorten_text(method), method);
+    }
+
+    #[test]
+    fn text_path_shortener_handles_single_and_double_quoted_paths_with_spaces() {
+        let shortener = TextPathShortener::default();
+        assert_eq!(
+            shortener.shorten_text(
+                r#"Loaded "D:\Firmware Files\update.zip" and 'D:\OTA Builds\next.zip'."#
+            ),
+            r#"Loaded "update.zip" and 'next.zip'."#
+        );
+    }
+
+    #[test]
+    fn text_path_shortener_handles_unc_and_extended_length_paths() {
+        let shortener = TextPathShortener::default();
+        let text = r"Copied \\server\share\firmware\boot.img to \\?\D:\DynoBox\output\boot.img.";
+        assert_eq!(shortener.shorten_text(text), "Copied boot.img to boot.img.");
+
+        let mut rooted_shortener = TextPathShortener::default();
+        let _ = rooted_shortener.shorten_event(ProgressEvent::CommandStarted {
+            command: CommandKind::Apply,
+            input: PathBuf::from(r"\\server\share\firmware"),
+            output: PathBuf::from(r"\\?\D:\DynoBox\output"),
+        });
+        assert_eq!(
+            rooted_shortener.shorten_text(text),
+            "Copied boot.img to boot.img."
+        );
+    }
+
+    #[test]
+    fn text_path_shortener_leaves_scheme_relative_urls_unchanged() {
+        let shortener = TextPathShortener::default();
+        let text = "Fetch //cdn.example.com/a/b before continuing.";
+        assert_eq!(shortener.shorten_text(text), text);
     }
 
     #[test]
