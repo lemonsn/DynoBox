@@ -1,7 +1,7 @@
-# Skip Lenovo ID and EasySync while keeping the final Home button usable.
+# Hide User Experience, skip Lenovo ID and EasySync, and keep Home usable.
 
 name = "debloat-setupwizard"
-description = "Skip the Lenovo ID entry screen and the removed XuiEasySync restore activity; keep the final home button visible across creation and transition completion without the Vantage widget."
+description = "Hide the non-functional User Experience row, skip the Lenovo ID entry screen and removed XuiEasySync restore activity, and keep the final home button visible without the Vantage widget."
 
 [[op]]
 kind = "invoke_const_bool"
@@ -24,6 +24,72 @@ target_class = "Lcom/tblenovo/setup/utils/SharedPreHelper;"
 target_method = "isCloudRestoreCompleted"
 proto = "(Landroid/content/Context;)Z"
 value = true
+
+[[op]]
+kind = "method_code_patch"
+partition = "system"
+file = "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk"
+class = "Lcom/zui/setupwizard/PrivacyAndSettingActivity;"
+method = "initView"
+proto = "()V"
+
+[[op.symbol]]
+name = "user_experience_row"
+kind = "field"
+class = "Lcom/zui/setupwizard/PrivacyAndSettingActivity;"
+field = "mUserExperience"
+ty = "Landroid/widget/RelativeLayout;"
+
+[[op.symbol]]
+name = "row_click"
+kind = "method"
+class = "Landroid/widget/RelativeLayout;"
+method = "setOnClickListener"
+proto = "(Landroid/view/View$OnClickListener;)V"
+
+[[op.symbol]]
+name = "set_visibility"
+kind = "method"
+class = "Landroid/view/View;"
+method = "setVisibility"
+proto = "(I)V"
+
+[[op.replacement]]
+from = "54 53 ${user_experience_row:u16} 38 03 05 00 6e 20 ${row_click:u16} 53 00"
+to = "54 53 ${user_experience_row:u16} 13 04 08 00 6e 20 ${set_visibility:u16} 43 00"
+
+[[op]]
+kind = "method_code_patch"
+partition = "system"
+file = "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk"
+class = "Lcom/zui/setupwizard/PrivacyAndSettingActivity;"
+method = "initView"
+proto = "()V"
+
+[[op.symbol]]
+name = "user_experience_row"
+kind = "field"
+class = "Lcom/zui/setupwizard/PrivacyAndSettingActivity;"
+field = "mUserExperience"
+ty = "Landroid/widget/RelativeLayout;"
+
+[[op.symbol]]
+name = "row_click"
+kind = "method"
+class = "Landroid/widget/RelativeLayout;"
+method = "setOnClickListener"
+proto = "(Landroid/view/View$OnClickListener;)V"
+
+[[op.symbol]]
+name = "set_visibility"
+kind = "method"
+class = "Landroid/view/View;"
+method = "setVisibility"
+proto = "(I)V"
+
+[[op.replacement]]
+from = "54 50 ${user_experience_row:u16} 38 00 05 00 6e 20 ${row_click:u16} 50 00"
+to = "54 50 ${user_experience_row:u16} 13 04 08 00 6e 20 ${set_visibility:u16} 40 00"
 
 [[op]]
 kind = "field_const_bool"

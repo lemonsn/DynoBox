@@ -152,6 +152,28 @@ This operation deliberately cannot grow a method, create strings/method/field
 references, or repair arbitrary verifier-invalid register typing. Pin patterns
 to one known instruction shape and validate the emitted DEX before flashing.
 
+### `method_code_redirect`
+
+Redirect one encoded method to an already-present code item without rewriting
+either body. Both methods are resolved by class, name, and full prototype. This
+is intended for an R8-deduplicated target whose shared body cannot safely be
+changed in place.
+
+| field          | required | meaning                                |
+|----------------|----------|----------------------------------------|
+| `class`        | yes      | target JVM class descriptor            |
+| `method`       | yes      | exact target method name               |
+| `proto`        | yes      | full target JVM method descriptor      |
+| `donor_class`  | yes      | donor JVM class descriptor             |
+| `donor_method` | yes      | exact donor method name                |
+| `donor_proto`  | yes      | full donor JVM method descriptor       |
+
+DynoBox changes only the target encoded method's `code_off` ULEB128. It refuses
+missing or ambiguous methods, different return descriptors, any mismatch in
+`registers_size`, `ins_size`, `outs_size`, `tries_size`, or `insns_size`, and
+old/new offsets with different ULEB128 widths. Code-item headers, instructions,
+try items, and handlers remain byte-identical, and the DEX length never changes.
+
 ### `resource_bool`
 
 Force a compiled boolean resource inside a STORED `resources.arsc` APK entry to
@@ -423,9 +445,14 @@ while still advancing the setup wizard.
     `isPrcVersion()` call → `false` so the first-boot one-shot disable of the
     nine Google packages (Play Store / GmsCore / GSF / …) does not run.
 * **`debloat-setupwizard.dbp`** — make the first-boot flow independent of the
-  removed `XuiEasySync.apk`, skip the Lenovo ID entry screen, and keep the final
-  home button usable without the Vantage widget (7 ops across the
+  removed `XuiEasySync.apk`, hide the non-functional User Experience row, skip
+  the Lenovo ID entry screen, and keep the final home button usable without the
+  Vantage widget (10 ops across the
   setup wizard, ZuiSettings, and LenovoID):
+  * **Hide User Experience** — two mutually exclusive, exact method-code shapes
+    cover 1.5.10.063 and .183. Each replaces the row's null-check/listener block
+    with one self-contained `iget-object` + `const/16 v4, View.GONE` +
+    `setVisibility(v4)` sequence; the earlier Settings read remains untouched.
   * **Fix Wi-Fi Next / Set up later** — in
     `DeviceActivationForWifiActivity.startPrivacySettingsActivity`, force its
     `isNetworkAvail` field read → `true` (`field_const_bool`) and its scoped
@@ -454,6 +481,7 @@ while still advancing the setup wizard.
     `AppHelper.isSupportCCS()` result in `CompleteLandActivity.onCreate` →
     `true`. Without a Vantage widget rectangle, the stock false branch hides
     `btn_next`, shows the loading view, and waits for a launcher transition.
+    The same gate is forced in `onEnterEnd` after the transition.
 
   > Keep `LenovoID.apk` installed; the patch rewrites its entry `onCreate` and
   > EasySync continuations in place rather than removing the package. Do not
@@ -484,6 +512,13 @@ while still advancing the setup wizard.
   `return 0` that R8 deduplicated with `ImmutableMap.isHashCodeFast():Z`, so it
   can't be rewritten — DynoBox refuses shared/deduped code items, see
   `dex_patch::code_off_is_shared` — but the region gate is the real switch anyway.)
+  The User Experience controller remains hidden at runtime with
+  `preference_controller_hide`; its deferred-setup suggestion is completed
+  unconditionally and its Activity closes rather than showing the dialog.
+  Search deindexing uses mutually exclusive `method_code_redirect` donors for
+  .063/.183 to point only `UserExperienceSwitchController.getAvailabilityStatus`
+  at an existing return-3 body, leaving the 598-way R8-shared return-0 body
+  untouched.
 * **`debloat-theme.dbp`** — hide the ZuiHomeSettings FontActivity online catalog
   while keeping Local fonts. Forces every
   `Utilities.isBusinessProject(Context)` call inside `FontActivity` → true so

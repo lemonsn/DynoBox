@@ -1,8 +1,8 @@
-# Hide LeCloud, Service hotline, and the orphaned User Experience entry,
-# and show AOSP Accounts & sync.
+# Hide LeCloud, Service hotline, and every live User Experience surface;
+# suppress its setup suggestion and show AOSP Accounts & sync.
 
 name = "debloat-settings"
-description = "Hide the ZuiSettings LeCloud account tile, Service hotline, and orphaned User Experience entry, and always show the AOSP Accounts & sync entry."
+description = "Hide the ZuiSettings LeCloud tile, Service hotline, and User Experience preference and search result; suppress its deferred-setup suggestion and always show AOSP Accounts & sync."
 
 [[op]]
 kind = "method_const_int"
@@ -19,6 +19,64 @@ file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
 class = "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;"
 preference_key = "user_experience"
 preference_field = "mUserExperience"
+
+[[op]]
+kind = "method_const_bool"
+partition = "system"
+file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
+class = "Lcom/lenovo/settings/suggestion/UserExperienceSuggestionActivity;"
+method = "isSuggestionComplete"
+proto = "(Landroid/content/Context;)Z"
+value = true
+
+# A stale suggestion or direct launch must close instead of drawing the dialog.
+[[op]]
+kind = "method_code_patch"
+partition = "system"
+file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
+class = "Lcom/lenovo/settings/suggestion/UserExperienceSuggestionActivity;"
+method = "onCreate"
+proto = "(Landroid/os/Bundle;)V"
+
+[[op.symbol]]
+name = "show_dialog"
+kind = "method"
+class = "Lcom/lenovo/common/utils/LenovoUtils;"
+method = "showJoinUserExperienceDialog"
+proto = "(Landroid/content/Context;Ljava/lang/Runnable;Ljava/lang/Runnable;Ljava/lang/Runnable;Z)V"
+
+[[op.symbol]]
+name = "finish"
+kind = "method"
+class = "Landroid/app/Activity;"
+method = "finish"
+proto = "()V"
+
+[[op.replacement]]
+from = "71 54 ${show_dialog:u16} 03 21"
+to = "6e 10 ${finish:u16} 03 00"
+
+[[op]]
+kind = "method_code_redirect"
+partition = "system"
+file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
+class = "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;"
+method = "getAvailabilityStatus"
+proto = "()I"
+donor_class = "Lcom/lenovo/settings/widget/UnsupportedPreferenceController;"
+donor_method = "getAvailabilityStatus"
+donor_proto = "()I"
+
+[[op]]
+kind = "method_code_redirect"
+partition = "system"
+file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
+class = "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;"
+method = "getAvailabilityStatus"
+proto = "()I"
+donor_class = "Lcom/google/android/material/sidesheet/SideSheetDialog;"
+donor_method = "getStateOnStart"
+donor_proto = "()I"
 
 [[op]]
 kind = "method_const_int"

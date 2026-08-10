@@ -31,6 +31,10 @@
 //!   hatch for control-flow fixes that cannot be expressed by the higher-level
 //!   primitives without adding dex ids or code units. DBP templates may resolve
 //!   their existing pool operands by descriptor before calling this primitive.
+//! * [`redirect_method_code`] — redirect one encoded method to an existing,
+//!   shape-compatible code item selected through a second method descriptor.
+//!   This changes only the target method's same-width ULEB128 `code_off`, so an
+//!   R8-shared body remains byte-identical for every other method using it.
 //! * [`force_nop_anchored_invoke`] — nop the first
 //!   `target_class.target_method(...)` invoke (whose result is discarded)
 //!   that follows a specific constant load inside one scan method. Drops a
@@ -117,21 +121,79 @@ struct DexHeader {
     class_defs_off: usize,
 }
 
-fn read_dex_header(dex: &[u8]) -> DexHeader {
-    DexHeader {
-        string_ids_size: read_u32_le(dex, 0x38) as usize,
-        string_ids_off: read_u32_le(dex, 0x3C) as usize,
-        type_ids_size: read_u32_le(dex, 0x40) as usize,
-        type_ids_off: read_u32_le(dex, 0x44) as usize,
-        proto_ids_size: read_u32_le(dex, 0x48) as usize,
-        proto_ids_off: read_u32_le(dex, 0x4C) as usize,
-        field_ids_size: read_u32_le(dex, 0x50) as usize,
-        field_ids_off: read_u32_le(dex, 0x54) as usize,
-        method_ids_size: read_u32_le(dex, 0x58) as usize,
-        method_ids_off: read_u32_le(dex, 0x5C) as usize,
-        class_defs_size: read_u32_le(dex, 0x60) as usize,
-        class_defs_off: read_u32_le(dex, 0x64) as usize,
+fn read_dex_header(dex: &[u8]) -> Option<DexHeader> {
+    fn u32_at(dex: &[u8], off: usize) -> Option<usize> {
+        let bytes: [u8; 4] = dex.get(off..off.checked_add(4)?)?.try_into().ok()?;
+        usize::try_from(u32::from_le_bytes(bytes)).ok()
     }
+
+    fn table_fits(dex: &[u8], size: usize, off: usize, entry_size: usize) -> bool {
+        size.checked_mul(entry_size)
+            .and_then(|bytes| off.checked_add(bytes))
+            .is_some_and(|end| end <= dex.len())
+    }
+
+    let header = DexHeader {
+        string_ids_size: u32_at(dex, 0x38)?,
+        string_ids_off: u32_at(dex, 0x3c)?,
+        type_ids_size: u32_at(dex, 0x40)?,
+        type_ids_off: u32_at(dex, 0x44)?,
+        proto_ids_size: u32_at(dex, 0x48)?,
+        proto_ids_off: u32_at(dex, 0x4c)?,
+        field_ids_size: u32_at(dex, 0x50)?,
+        field_ids_off: u32_at(dex, 0x54)?,
+        method_ids_size: u32_at(dex, 0x58)?,
+        method_ids_off: u32_at(dex, 0x5c)?,
+        class_defs_size: u32_at(dex, 0x60)?,
+        class_defs_off: u32_at(dex, 0x64)?,
+    };
+    [
+        (header.string_ids_size, header.string_ids_off, 4usize),
+        (header.type_ids_size, header.type_ids_off, 4),
+        (header.proto_ids_size, header.proto_ids_off, 12),
+        (header.field_ids_size, header.field_ids_off, 8),
+        (header.method_ids_size, header.method_ids_off, 8),
+        (header.class_defs_size, header.class_defs_off, 32),
+    ]
+    .into_iter()
+    .all(|(size, off, entry_size)| table_fits(dex, size, off, entry_size))
+    .then_some(header)
+}
+
+fn find_unique_string_idx(dex: &[u8], h: &DexHeader, value: &str) -> Result<Option<u32>> {
+    let mut found = None;
+    for idx in 0..h.string_ids_size {
+        let Ok(idx_u32) = u32::try_from(idx) else {
+            return Ok(None);
+        };
+        if dex_walker::read_string_at_idx(dex, h.string_ids_size, h.string_ids_off, idx_u32)?
+            .as_deref()
+            == Some(value)
+        {
+            if found.is_some() {
+                return Ok(None);
+            }
+            found = Some(idx_u32);
+        }
+    }
+    Ok(found)
+}
+
+fn find_unique_type_idx(dex: &[u8], h: &DexHeader, descriptor: &str) -> Result<Option<u32>> {
+    let Some(descriptor_idx) = find_unique_string_idx(dex, h, descriptor)? else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for idx in 0..h.type_ids_size {
+        let entry_off = h.type_ids_off + idx * 4;
+        if read_u32_le(dex, entry_off) == descriptor_idx {
+            if found.is_some() {
+                return Ok(None);
+            }
+            found = u32::try_from(idx).ok();
+        }
+    }
+    Ok(found)
 }
 
 /// Resolve the exact field id for `class_descriptor.field_name:type_descriptor`.
@@ -172,14 +234,11 @@ fn resolve_field_idx(
 
     for idx in 0..h.field_ids_size {
         let off = h.field_ids_off + idx * 8;
-        if off + 8 > dex.len() {
-            return Ok(None);
-        }
         if u32::from(read_u16_le(dex, off)) == class_idx
             && u32::from(read_u16_le(dex, off + 2)) == type_idx
             && read_u32_le(dex, off + 4) == name_idx
         {
-            return Ok(Some(idx as u32));
+            return Ok(u32::try_from(idx).ok());
         }
     }
     Ok(None)
@@ -190,13 +249,45 @@ fn resolve_field_idx(
 /// `method_idx` is reconstructed from the per-section cumulative
 /// `method_idx_diff` ULEB128 (resets between the direct and virtual
 /// sections per the dex spec).
-fn collect_method_code_offs(dex: &[u8], class_data_off: usize) -> Result<Vec<(u32, usize)>> {
+fn collect_method_code_offs(
+    dex: &[u8],
+    class_data_off: usize,
+    method_ids_size: usize,
+) -> Result<Vec<(u32, usize)>> {
+    Ok(
+        collect_encoded_methods(dex, class_data_off, method_ids_size)?
+            .into_iter()
+            .filter(|method| method.code_off != 0)
+            .map(|method| (method.method_idx, method.code_off))
+            .collect(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EncodedMethod {
+    method_idx: u32,
+    code_off: usize,
+    code_off_field_off: usize,
+    code_off_width: usize,
+}
+
+/// Walk a class data item's encoded methods while retaining the byte location
+/// and serialized width of each `code_off`. The latter is the only field that
+/// [`redirect_method_code`] may rewrite.
+fn collect_encoded_methods(
+    dex: &[u8],
+    class_data_off: usize,
+    method_ids_size: usize,
+) -> Result<Vec<EncodedMethod>> {
     let mut p = class_data_off;
     let static_fields_size = dex_walker::read_uleb128(dex, &mut p)?;
     let instance_fields_size = dex_walker::read_uleb128(dex, &mut p)?;
     let direct_methods_size = dex_walker::read_uleb128(dex, &mut p)?;
     let virtual_methods_size = dex_walker::read_uleb128(dex, &mut p)?;
-    for _ in 0..(static_fields_size + instance_fields_size) {
+    let field_count = static_fields_size
+        .checked_add(instance_fields_size)
+        .ok_or_else(|| anyhow!("dex encoded-field count overflow"))?;
+    for _ in 0..field_count {
         let _ = dex_walker::read_uleb128(dex, &mut p)?;
         let _ = dex_walker::read_uleb128(dex, &mut p)?;
     }
@@ -205,15 +296,58 @@ fn collect_method_code_offs(dex: &[u8], class_data_off: usize) -> Result<Vec<(u3
         let mut method_idx_acc: u64 = 0;
         for _ in 0..size {
             let diff = dex_walker::read_uleb128(dex, &mut p)?;
-            method_idx_acc += diff;
+            method_idx_acc = method_idx_acc
+                .checked_add(diff)
+                .ok_or_else(|| anyhow!("dex encoded-method index overflow"))?;
+            let method_idx = u32::try_from(method_idx_acc)
+                .ok()
+                .filter(|&idx| usize::try_from(idx).is_ok_and(|idx| idx < method_ids_size))
+                .ok_or_else(|| anyhow!("dex encoded-method index exceeds method_ids"))?;
             let _access = dex_walker::read_uleb128(dex, &mut p)?;
-            let code_off = dex_walker::read_uleb128(dex, &mut p)? as usize;
-            if code_off != 0 {
-                out.push((method_idx_acc as u32, code_off));
-            }
+            let code_off_field_off = p;
+            let code_off = usize::try_from(dex_walker::read_uleb128(dex, &mut p)?)
+                .map_err(|_| anyhow!("dex encoded-method code offset exceeds address space"))?;
+            out.push(EncodedMethod {
+                method_idx,
+                code_off,
+                code_off_field_off,
+                code_off_width: p - code_off_field_off,
+            });
         }
     }
     Ok(out)
+}
+
+/// Find the one encoded-method record for `method_idx` across all class data.
+/// Duplicate records are ambiguous and therefore refused.
+fn find_unique_encoded_method(
+    dex: &[u8],
+    h: &DexHeader,
+    method_idx: u32,
+) -> Result<Option<EncodedMethod>> {
+    let mut found = None;
+    for idx in 0..h.class_defs_size {
+        let entry_off = h.class_defs_off + idx * 32;
+        if entry_off + 32 > dex.len() {
+            return Ok(None);
+        }
+        let class_data_off = read_u32_le(dex, entry_off + 24) as usize;
+        if class_data_off == 0 {
+            continue;
+        }
+        if class_data_off >= dex.len() {
+            return Ok(None);
+        }
+        for method in collect_encoded_methods(dex, class_data_off, h.method_ids_size)? {
+            if method.method_idx == method_idx {
+                if found.is_some() {
+                    return Ok(None);
+                }
+                found = Some(method);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Resolve `method_idx` to its method-name string, or `None` when the idx is
@@ -230,8 +364,110 @@ fn method_name_of_idx(dex: &[u8], h: &DexHeader, method_idx: u32) -> Result<Opti
     dex_walker::read_string_at_idx(dex, h.string_ids_size, h.string_ids_off, name_idx)
 }
 
+fn proto_parameters_match(dex: &[u8], parameters_off: usize, expected: &[u32]) -> Result<bool> {
+    if expected.is_empty() {
+        return Ok(parameters_off == 0);
+    }
+    if parameters_off == 0 {
+        return Ok(false);
+    }
+    let list_size_off_end = parameters_off
+        .checked_add(4)
+        .filter(|&end| end <= dex.len())
+        .ok_or_else(|| anyhow!("dex proto parameter list header out of bounds"))?;
+    let list_size = usize::try_from(read_u32_le(dex, parameters_off))
+        .map_err(|_| anyhow!("dex proto parameter count exceeds address space"))?;
+    if list_size != expected.len() {
+        return Ok(false);
+    }
+    let list_end = list_size_off_end
+        .checked_add(
+            list_size
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("dex proto parameter list overflow"))?,
+        )
+        .filter(|&end| end <= dex.len())
+        .ok_or_else(|| anyhow!("dex proto parameter list out of bounds"))?;
+    Ok(dex[list_size_off_end..list_end]
+        .chunks_exact(2)
+        .zip(expected)
+        .all(|(actual, expected)| {
+            u32::from(u16::from_le_bytes([actual[0], actual[1]])) == *expected
+        }))
+}
+
+fn find_unique_proto_idx(
+    dex: &[u8],
+    h: &DexHeader,
+    ret_descriptor: &str,
+    params: &[&str],
+) -> Result<Option<u32>> {
+    let Some(ret_idx) = find_unique_type_idx(dex, h, ret_descriptor)? else {
+        return Ok(None);
+    };
+    let mut param_idxs = Vec::with_capacity(params.len());
+    for descriptor in params {
+        let Some(idx) = find_unique_type_idx(dex, h, descriptor)? else {
+            return Ok(None);
+        };
+        param_idxs.push(idx);
+    }
+
+    let mut found = None;
+    for idx in 0..h.proto_ids_size {
+        let off = h.proto_ids_off + idx * 12;
+        if read_u32_le(dex, off + 4) == ret_idx
+            && proto_parameters_match(
+                dex,
+                usize::try_from(read_u32_le(dex, off + 8))
+                    .map_err(|_| anyhow!("dex proto parameters offset exceeds address space"))?,
+                &param_idxs,
+            )?
+        {
+            if found.is_some() {
+                return Ok(None);
+            }
+            found = u32::try_from(idx).ok();
+        }
+    }
+    Ok(found)
+}
+
 /// Resolve the method idx for `class.method(params...)ret` referenced in this
 /// dex, or `None` when any component isn't present.
+fn resolve_unique_method_idx(
+    dex: &[u8],
+    h: &DexHeader,
+    class_descriptor: &str,
+    method_name: &str,
+    ret_descriptor: &str,
+    params: &[&str],
+) -> Result<Option<u32>> {
+    let Some(class_type_idx) = find_unique_type_idx(dex, h, class_descriptor)? else {
+        return Ok(None);
+    };
+    let Some(name_idx) = find_unique_string_idx(dex, h, method_name)? else {
+        return Ok(None);
+    };
+    let Some(proto_idx) = find_unique_proto_idx(dex, h, ret_descriptor, params)? else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for idx in 0..h.method_ids_size {
+        let off = h.method_ids_off + idx * 8;
+        if u32::from(read_u16_le(dex, off)) == class_type_idx
+            && u32::from(read_u16_le(dex, off + 2)) == proto_idx
+            && read_u32_le(dex, off + 4) == name_idx
+        {
+            if found.is_some() {
+                return Ok(None);
+            }
+            found = u32::try_from(idx).ok();
+        }
+    }
+    Ok(found)
+}
+
 fn resolve_method_idx(
     dex: &[u8],
     h: &DexHeader,
@@ -320,7 +556,8 @@ fn find_method_code_off(
     else {
         return Ok(None);
     };
-    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off)? {
+    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off, h.method_ids_size)?
+    {
         if method_idx == want_method_idx {
             return Ok(Some(code_off));
         }
@@ -348,7 +585,7 @@ fn code_off_is_shared(dex: &[u8], h: &DexHeader, code_off: usize) -> Result<bool
         if class_data_off == 0 || class_data_off >= dex.len() {
             continue;
         }
-        let Ok(offs) = collect_method_code_offs(dex, class_data_off) else {
+        let Ok(offs) = collect_method_code_offs(dex, class_data_off, h.method_ids_size) else {
             continue;
         };
         for (_m, off) in offs {
@@ -361,6 +598,241 @@ fn code_off_is_shared(dex: &[u8], h: &DexHeader, code_off: usize) -> Result<bool
         }
     }
     Ok(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodeItemShape {
+    registers_size: u16,
+    ins_size: u16,
+    outs_size: u16,
+    tries_size: u16,
+    insns_size: u32,
+}
+
+fn read_sleb128_i32(dex: &[u8], p: &mut usize) -> Option<i32> {
+    let mut result = 0i64;
+    let mut shift = 0u32;
+    for _ in 0..5 {
+        let byte = *dex.get(*p)?;
+        *p = p.checked_add(1)?;
+        result |= i64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            if shift < 32 && byte & 0x40 != 0 {
+                result |= !0i64 << shift;
+            }
+            return i32::try_from(result).ok();
+        }
+    }
+    None
+}
+
+fn read_uleb128_u32(dex: &[u8], p: &mut usize) -> Option<u32> {
+    u32::try_from(dex_walker::read_uleb128(dex, p).ok()?).ok()
+}
+
+fn validate_code_item_tail(
+    dex: &[u8],
+    h: &DexHeader,
+    mut tail_off: usize,
+    insns_size: u32,
+    tries_size: u16,
+) -> Option<()> {
+    if tries_size == 0 {
+        return Some(());
+    }
+    if insns_size % 2 != 0 {
+        if read_code_unit(dex, tail_off)? != 0 {
+            return None;
+        }
+        tail_off = tail_off.checked_add(2).filter(|&off| off <= dex.len())?;
+    }
+    let tries_bytes = usize::from(tries_size).checked_mul(8)?;
+    let tries_end = tail_off
+        .checked_add(tries_bytes)
+        .filter(|&end| end <= dex.len())?;
+    let handlers_base = tries_end;
+    let mut p = handlers_base;
+    let handler_count = usize::try_from(read_uleb128_u32(dex, &mut p)?).ok()?;
+    let mut handler_offsets = BTreeSet::new();
+    for _ in 0..handler_count {
+        handler_offsets.insert(p.checked_sub(handlers_base)?);
+        let size = read_sleb128_i32(dex, &mut p)?;
+        let typed_count = usize::try_from(size.unsigned_abs()).ok()?;
+        for _ in 0..typed_count {
+            let type_idx = usize::try_from(read_uleb128_u32(dex, &mut p)?).ok()?;
+            let address = read_uleb128_u32(dex, &mut p)?;
+            if type_idx >= h.type_ids_size || address >= insns_size {
+                return None;
+            }
+        }
+        if size <= 0 && read_uleb128_u32(dex, &mut p)? >= insns_size {
+            return None;
+        }
+    }
+
+    for try_off in (tail_off..tries_end).step_by(8) {
+        let start_addr = read_u32_le(dex, try_off);
+        let insn_count = u32::from(read_u16_le(dex, try_off + 4));
+        let handler_off = usize::from(read_u16_le(dex, try_off + 6));
+        if start_addr
+            .checked_add(insn_count)
+            .is_none_or(|end| end > insns_size)
+            || !handler_offsets.contains(&handler_off)
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn code_item_shape(dex: &[u8], h: &DexHeader, code_off: usize) -> Option<CodeItemShape> {
+    if code_off == 0 || code_off % 4 != 0 || code_off.checked_add(16)? > dex.len() {
+        return None;
+    }
+    let insns_size = read_u32_le(dex, code_off + 12);
+    let insns_bytes = usize::try_from(insns_size).ok()?.checked_mul(2)?;
+    let tail_off = code_off.checked_add(16)?.checked_add(insns_bytes)?;
+    if tail_off > dex.len() {
+        return None;
+    }
+    let shape = CodeItemShape {
+        registers_size: read_u16_le(dex, code_off),
+        ins_size: read_u16_le(dex, code_off + 2),
+        outs_size: read_u16_le(dex, code_off + 4),
+        tries_size: read_u16_le(dex, code_off + 6),
+        insns_size,
+    };
+    validate_code_item_tail(dex, h, tail_off, insns_size, shape.tries_size)?;
+    Some(shape)
+}
+
+fn encode_uleb128_u32(mut value: u32) -> ([u8; 5], usize) {
+    let mut encoded = [0u8; 5];
+    let mut width = 0usize;
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        encoded[width] = byte;
+        width += 1;
+        if value == 0 {
+            return (encoded, width);
+        }
+    }
+}
+
+fn redirect_encoded_method_code_off(
+    dex: &mut [u8],
+    target: EncodedMethod,
+    donor_code_off: usize,
+) -> bool {
+    let Ok(old_code_off) = u32::try_from(target.code_off) else {
+        return false;
+    };
+    let Ok(new_code_off) = u32::try_from(donor_code_off) else {
+        return false;
+    };
+    let (old_encoded, old_width) = encode_uleb128_u32(old_code_off);
+    let (new_encoded, new_width) = encode_uleb128_u32(new_code_off);
+    let Some(field_end) = target
+        .code_off_field_off
+        .checked_add(target.code_off_width)
+        .filter(|&end| end <= dex.len())
+    else {
+        return false;
+    };
+    if old_width != target.code_off_width
+        || new_width != target.code_off_width
+        || dex[target.code_off_field_off..field_end] != old_encoded[..old_width]
+        || old_code_off == new_code_off
+    {
+        return false;
+    }
+    dex[target.code_off_field_off..field_end].copy_from_slice(&new_encoded[..new_width]);
+    true
+}
+
+fn redirect_compatible_code_off(
+    dex: &mut [u8],
+    h: &DexHeader,
+    target: EncodedMethod,
+    donor: EncodedMethod,
+    target_ret: &str,
+    donor_ret: &str,
+) -> bool {
+    if target_ret != donor_ret {
+        return false;
+    }
+    let (Some(target_shape), Some(donor_shape)) = (
+        code_item_shape(dex, h, target.code_off),
+        code_item_shape(dex, h, donor.code_off),
+    ) else {
+        return false;
+    };
+    target_shape == donor_shape && redirect_encoded_method_code_off(dex, target, donor.code_off)
+}
+
+/// Redirect one fully-qualified method's encoded `code_off` to the existing
+/// code item owned by another fully-qualified method.
+///
+/// No code-item bytes are changed. The operation resolves both methods through
+/// their class/name/prototype symbols, requires one unambiguous encoded-method
+/// record for each, exact return descriptors, identical `registers_size`,
+/// `ins_size`, `outs_size`, `tries_size`, and `insns_size`, and equal canonical
+/// ULEB128 widths for the old and replacement offsets. Any failed condition is
+/// a safe no-op, leaving the DEX byte-identical.
+#[derive(Debug, Clone, Copy)]
+pub struct DexMethodRef<'a> {
+    pub class: &'a str,
+    pub name: &'a str,
+    pub ret: &'a str,
+    pub params: &'a [&'a str],
+}
+
+pub fn redirect_method_code(
+    dex: &mut [u8],
+    target: DexMethodRef<'_>,
+    donor: DexMethodRef<'_>,
+) -> Result<bool> {
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
+    let Some(target_method_idx) = resolve_unique_method_idx(
+        dex,
+        &h,
+        target.class,
+        target.name,
+        target.ret,
+        target.params,
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(donor_method_idx) =
+        resolve_unique_method_idx(dex, &h, donor.class, donor.name, donor.ret, donor.params)?
+    else {
+        return Ok(false);
+    };
+    if target_method_idx == donor_method_idx {
+        return Ok(false);
+    }
+    let Some(target_encoded) = find_unique_encoded_method(dex, &h, target_method_idx)? else {
+        return Ok(false);
+    };
+    let Some(donor_encoded) = find_unique_encoded_method(dex, &h, donor_method_idx)? else {
+        return Ok(false);
+    };
+    Ok(redirect_compatible_code_off(
+        dex,
+        &h,
+        target_encoded,
+        donor_encoded,
+        target.ret,
+        donor.ret,
+    ))
 }
 
 /// A descriptor-resolved DEX pool entry used by symbolic method-code
@@ -402,7 +874,9 @@ pub(crate) fn resolve_dex_pool_symbol(
     dex: &[u8],
     symbol: DexPoolSymbol<'_>,
 ) -> Result<Option<u32>> {
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(None);
+    };
     match symbol {
         DexPoolSymbol::String(value) => {
             dex_walker::find_string_idx_strict(dex, h.string_ids_size, h.string_ids_off, value)
@@ -509,7 +983,10 @@ pub struct MethodCodeReplacement<'a> {
 /// operation is abandoned without mutating `dex` if any one does not. The
 /// final body is decoded again and every ordinary branch target is required to
 /// land on an instruction boundary. Code-item size and structural fields are
-/// never changed, and R8-shared code items are refused.
+/// never changed, R8-shared code items are refused, and an invoke immediately
+/// consumed by `move-result*` cannot be overwritten. This is not a register-type
+/// dataflow verifier: callers must still prove all replacement register values
+/// are verifier-compatible at every later use and control-flow merge.
 pub fn patch_method_code(
     dex: &mut [u8],
     class_descriptor: &str,
@@ -522,7 +999,9 @@ pub fn patch_method_code(
         return Ok(false);
     }
 
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
     let Some(code_off) = find_method_code_off(
         dex,
         &h,
@@ -572,6 +1051,11 @@ pub fn patch_method_code(
         {
             return Err(anyhow!("method-code replacement has overlapping matches"));
         }
+        if matches.iter().copied().any(|off| {
+            replacement_overwrites_consumed_invoke(&working, off, replacement.to).unwrap_or(true)
+        }) {
+            return Ok(false);
+        }
         for off in matches {
             working[off..off + replacement.to.len()].copy_from_slice(replacement.to);
         }
@@ -580,6 +1064,47 @@ pub fn patch_method_code(
     validate_method_control_flow(&working)?;
     dex[insns_start..insns_end].copy_from_slice(&working);
     Ok(true)
+}
+
+fn invoke_result_is_consumed(insns: &[u8], invoke_off: usize, invoke_width: usize) -> bool {
+    invoke_off
+        .checked_add(invoke_width)
+        .and_then(|next| insns.get(next))
+        .is_some_and(|opcode| matches!(opcode, 0x0a..=0x0c))
+}
+
+fn replacement_overwrites_consumed_invoke(
+    insns: &[u8],
+    replacement_off: usize,
+    replacement: &[u8],
+) -> Result<bool> {
+    let replacement_end = replacement_off
+        .checked_add(replacement.len())
+        .filter(|&end| end <= insns.len())
+        .ok_or_else(|| anyhow!("method-code replacement range exceeds method body"))?;
+    let boundaries = instruction_boundaries(insns)?;
+    for invoke_off in boundaries
+        .into_iter()
+        .filter(|&off| off >= replacement_off && off < replacement_end)
+    {
+        if !matches!(insns[invoke_off], 0x6e..=0x72 | 0x74..=0x78) {
+            continue;
+        }
+        let invoke_width = instruction_width_bytes(insns, invoke_off)
+            .ok_or_else(|| anyhow!("invalid invoke in method-code replacement"))?;
+        let invoke_end = invoke_off
+            .checked_add(invoke_width)
+            .filter(|&end| end <= replacement_end)
+            .ok_or_else(|| anyhow!("method-code replacement splits an invoke"))?;
+        let replacement_invoke_off = invoke_off - replacement_off;
+        if invoke_result_is_consumed(insns, invoke_off, invoke_width)
+            && insns[invoke_off..invoke_end]
+                != replacement[replacement_invoke_off..replacement_invoke_off + invoke_width]
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +1231,9 @@ pub fn force_preference_controller_hidden(
     const SWITCH: &str = "Landroidx/preference/SwitchPreference;";
     const CONTROLLER: &str = "Lcom/android/settings/core/TogglePreferenceController;";
 
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
     let Some(code_off) = find_method_code_off(
         dex,
         &h,
@@ -1000,7 +1527,9 @@ pub fn force_method_return_bool(
             "force_method_return_bool requires a boolean (Z) return, got `{ret_descriptor}`"
         ));
     }
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
     let Some(code_off) = find_method_code_off(
         dex,
         &h,
@@ -1045,7 +1574,9 @@ pub fn force_method_return_int(
             "force_method_return_int requires an integer (I) return, got `{ret_descriptor}`"
         ));
     }
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
     let Some(code_off) = find_method_code_off(
         dex,
         &h,
@@ -1128,7 +1659,9 @@ pub fn force_method_return_void(
             "force_method_return_void requires a void (V) return, got `{ret_descriptor}`"
         ));
     }
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
     let Some(code_off) = find_method_code_off(
         dex,
         &h,
@@ -1205,7 +1738,9 @@ pub fn force_fragment_render_gone(
         "Landroid/view/ViewGroup;",
         "Landroid/os/Bundle;",
     ];
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
     let Some(code_off) = find_method_code_off(
         dex,
         &h,
@@ -1398,7 +1933,9 @@ fn force_invoke_const_scoped(
     params: &[&str],
     value: i32,
 ) -> Result<usize> {
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(0);
+    };
     let Some(scan_type_idx) = dex_walker::find_type_idx(
         dex,
         h.string_ids_size,
@@ -1422,7 +1959,8 @@ fn force_invoke_const_scoped(
     };
 
     let mut sites = 0usize;
-    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off)? {
+    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off, h.method_ids_size)?
+    {
         if let Some(want) = scan_method {
             if method_name_of_idx(dex, &h, method_idx)?.as_deref() != Some(want) {
                 continue;
@@ -1534,7 +2072,9 @@ pub fn force_nop_anchored_invoke(
     params: &[&str],
     anchor: NopAnchor<'_>,
 ) -> Result<usize> {
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(0);
+    };
     let Some(scan_type_idx) = dex_walker::find_type_idx(
         dex,
         h.string_ids_size,
@@ -1569,7 +2109,8 @@ pub fn force_nop_anchored_invoke(
     };
 
     let mut sites = 0usize;
-    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off)? {
+    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off, h.method_ids_size)?
+    {
         if method_name_of_idx(dex, &h, method_idx)?.as_deref() != Some(scan_method) {
             continue;
         }
@@ -1666,8 +2207,7 @@ fn rewrite_first_anchored_invoke(
         let is_target_invoke = matches!(opcode, 0x6e..=0x72 | 0x74..=0x78)
             && u32::from(read_u16_le(dex, pc + 2)) == target_method_idx;
         if armed && is_target_invoke {
-            let next_pc = pc + width;
-            let has_move_result = next_pc < insns_end && matches!(dex[next_pc], 0x0a..=0x0c);
+            let has_move_result = invoke_result_is_consumed(&dex[..insns_end], pc, width);
             if !has_move_result {
                 for b in &mut dex[pc..pc + width] {
                     *b = 0x00;
@@ -1701,7 +2241,9 @@ pub fn force_field_const_bool(
     target_field: &str,
     value: bool,
 ) -> Result<usize> {
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(0);
+    };
     let Some(scan_type_idx) = dex_walker::find_type_idx(
         dex,
         h.string_ids_size,
@@ -1727,7 +2269,8 @@ pub fn force_field_const_bool(
     };
 
     let mut sites = 0usize;
-    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off)? {
+    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off, h.method_ids_size)?
+    {
         if let Some(want) = scan_method {
             if method_name_of_idx(dex, &h, method_idx)?.as_deref() != Some(want) {
                 continue;
@@ -1937,7 +2480,9 @@ pub fn redirect_intent_action_to_broadcast(
     from_action: &str,
     to_action: &str,
 ) -> Result<usize> {
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(0);
+    };
     let Some(from_string_idx) =
         dex_walker::find_string_idx_strict(dex, h.string_ids_size, h.string_ids_off, from_action)?
     else {
@@ -1998,7 +2543,7 @@ pub fn redirect_intent_action_to_broadcast(
         if class_data_off == 0 || class_data_off >= dex.len() {
             continue;
         }
-        if let Ok(methods) = collect_method_code_offs(dex, class_data_off) {
+        if let Ok(methods) = collect_method_code_offs(dex, class_data_off, h.method_ids_size) {
             code_offsets.extend(methods.into_iter().map(|(_, code_off)| code_off));
         }
     }
@@ -2074,7 +2619,9 @@ pub fn force_method_broadcast_finish(
         ));
     }
 
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
     let Some(code_off) = find_method_code_off(
         dex,
         &h,
@@ -2369,7 +2916,9 @@ pub fn force_view_gone(
     view_ids: &[i32],
     scratch_reg: u8,
 ) -> Result<usize> {
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(0);
+    };
     let Some(scan_type_idx) = dex_walker::find_type_idx(
         dex,
         h.string_ids_size,
@@ -2396,7 +2945,8 @@ pub fn force_view_gone(
     };
 
     let mut hidden = 0usize;
-    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off)? {
+    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off, h.method_ids_size)?
+    {
         if method_name_of_idx(dex, &h, method_idx)?.as_deref() != Some(scan_method) {
             continue;
         }
@@ -2520,7 +3070,9 @@ pub fn force_remoteviews_gone(
     if rv_reg >= 16 || scratch_reg >= 16 {
         return Ok(0);
     }
-    let h = read_dex_header(dex);
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(0);
+    };
     let Some(scan_type_idx) = dex_walker::find_type_idx(
         dex,
         h.string_ids_size,
@@ -2552,7 +3104,8 @@ pub fn force_remoteviews_gone(
         return Ok(0);
     };
 
-    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off)? {
+    for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off, h.method_ids_size)?
+    {
         if method_name_of_idx(dex, &h, method_idx)?.as_deref() != Some(scan_method) {
             continue;
         }
@@ -2737,6 +3290,266 @@ mod tests {
         assert!(validate_method_control_flow(&[0x29, 0x00, 0x02, 0x00, 0x0e, 0x00]).is_ok());
         // +1 code unit lands in goto/16's own signed-offset operand.
         assert!(validate_method_control_flow(&[0x29, 0x00, 0x01, 0x00, 0x0e, 0x00]).is_err());
+    }
+
+    #[test]
+    fn method_code_replacement_refuses_invoke_with_consumed_result() {
+        let insns = [
+            0x12, 0x02, // const/4 v2, #0
+            0x71, 0x30, 0x34, 0x12, 0x10, 0x02, // invoke-static {v0,v1,v2}
+            0x0a, 0x00, // move-result v0
+            0x0e, 0x00, // return-void
+        ];
+        let replacement = [0x12, 0x02, 0x13, 0x04, 0x08, 0x00, 0x00, 0x00];
+        assert!(replacement_overwrites_consumed_invoke(&insns, 0, &replacement).unwrap());
+
+        let discarded = &insns[..8];
+        assert!(!replacement_overwrites_consumed_invoke(discarded, 0, &replacement).unwrap());
+    }
+
+    fn synthetic_redirect_fixture(
+        target_code_off: usize,
+        donor_code_off: usize,
+    ) -> (Vec<u8>, EncodedMethod, EncodedMethod) {
+        let mut dex = vec![0u8; donor_code_off.max(target_code_off) + 32];
+        for code_off in [target_code_off, donor_code_off] {
+            dex[code_off..code_off + 2].copy_from_slice(&1u16.to_le_bytes());
+            dex[code_off + 2..code_off + 4].copy_from_slice(&1u16.to_le_bytes());
+            dex[code_off + 12..code_off + 16].copy_from_slice(&2u32.to_le_bytes());
+            dex[code_off + 16..code_off + 20].copy_from_slice(&[0x12, 0x00, 0x0f, 0x00]);
+        }
+        let (old_encoded, old_width) = encode_uleb128_u32(target_code_off as u32);
+        dex[8..8 + old_width].copy_from_slice(&old_encoded[..old_width]);
+        (
+            dex,
+            EncodedMethod {
+                method_idx: 1,
+                code_off: target_code_off,
+                code_off_field_off: 8,
+                code_off_width: old_width,
+            },
+            EncodedMethod {
+                method_idx: 2,
+                code_off: donor_code_off,
+                code_off_field_off: 16,
+                code_off_width: encode_uleb128_u32(donor_code_off as u32).1,
+            },
+        )
+    }
+
+    fn synthetic_shape_header() -> DexHeader {
+        DexHeader {
+            string_ids_size: 0,
+            string_ids_off: 0,
+            type_ids_size: 1,
+            type_ids_off: 0,
+            proto_ids_size: 0,
+            proto_ids_off: 0,
+            field_ids_size: 0,
+            field_ids_off: 0,
+            method_ids_size: 0,
+            method_ids_off: 0,
+            class_defs_size: 0,
+            class_defs_off: 0,
+        }
+    }
+
+    fn write_u32(dex: &mut [u8], off: usize, value: u32) {
+        dex[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn append_dex_string(dex: &mut Vec<u8>, value: &str) -> u32 {
+        let off = u32::try_from(dex.len()).unwrap();
+        dex.push(u8::try_from(value.len()).unwrap());
+        dex.extend_from_slice(value.as_bytes());
+        dex.push(0);
+        off
+    }
+
+    fn synthetic_public_redirect_dex() -> Vec<u8> {
+        const STRING_IDS_OFF: usize = 0x70;
+        const TYPE_IDS_OFF: usize = 0x84;
+        const PROTO_IDS_OFF: usize = 0x90;
+        const METHOD_IDS_OFF: usize = 0x9c;
+        const CLASS_DEFS_OFF: usize = 0xb4;
+        const TARGET_CLASS_DATA_OFF: usize = 0x120;
+        const DONOR_CLASS_DATA_OFF: usize = 0x128;
+        const TARGET_CODE_OFF: usize = 0x140;
+        const DONOR_CODE_OFF: usize = 0x180;
+
+        let mut dex = vec![0u8; 0xf4];
+        for (off, value) in [
+            (0x38, 5u32),
+            (0x3c, STRING_IDS_OFF as u32),
+            (0x40, 3),
+            (0x44, TYPE_IDS_OFF as u32),
+            (0x48, 1),
+            (0x4c, PROTO_IDS_OFF as u32),
+            (0x50, 0),
+            (0x54, 0),
+            (0x58, 2),
+            (0x5c, METHOD_IDS_OFF as u32),
+            (0x60, 2),
+            (0x64, CLASS_DEFS_OFF as u32),
+        ] {
+            write_u32(&mut dex, off, value);
+        }
+
+        let strings = ["LTarget;", "LDonor;", "I", "target", "donor"];
+        for (idx, value) in strings.into_iter().enumerate() {
+            let string_off = append_dex_string(&mut dex, value);
+            write_u32(&mut dex, STRING_IDS_OFF + idx * 4, string_off);
+        }
+        dex.resize(DONOR_CODE_OFF + 20, 0);
+
+        for (idx, descriptor_idx) in [0u32, 1, 2].into_iter().enumerate() {
+            write_u32(&mut dex, TYPE_IDS_OFF + idx * 4, descriptor_idx);
+        }
+        write_u32(&mut dex, PROTO_IDS_OFF + 4, 2);
+
+        dex[METHOD_IDS_OFF..METHOD_IDS_OFF + 2].copy_from_slice(&0u16.to_le_bytes());
+        dex[METHOD_IDS_OFF + 2..METHOD_IDS_OFF + 4].copy_from_slice(&0u16.to_le_bytes());
+        write_u32(&mut dex, METHOD_IDS_OFF + 4, 3);
+        dex[METHOD_IDS_OFF + 8..METHOD_IDS_OFF + 10].copy_from_slice(&1u16.to_le_bytes());
+        dex[METHOD_IDS_OFF + 10..METHOD_IDS_OFF + 12].copy_from_slice(&0u16.to_le_bytes());
+        write_u32(&mut dex, METHOD_IDS_OFF + 12, 4);
+
+        write_u32(&mut dex, CLASS_DEFS_OFF, 0);
+        write_u32(&mut dex, CLASS_DEFS_OFF + 24, TARGET_CLASS_DATA_OFF as u32);
+        write_u32(&mut dex, CLASS_DEFS_OFF + 32, 1);
+        write_u32(
+            &mut dex,
+            CLASS_DEFS_OFF + 32 + 24,
+            DONOR_CLASS_DATA_OFF as u32,
+        );
+
+        for (class_data_off, method_idx, code_off) in [
+            (TARGET_CLASS_DATA_OFF, 0u8, TARGET_CODE_OFF as u32),
+            (DONOR_CLASS_DATA_OFF, 1u8, DONOR_CODE_OFF as u32),
+        ] {
+            dex[class_data_off..class_data_off + 6].copy_from_slice(&[0, 0, 1, 0, method_idx, 1]);
+            let (encoded, width) = encode_uleb128_u32(code_off);
+            dex[class_data_off + 6..class_data_off + 6 + width].copy_from_slice(&encoded[..width]);
+        }
+
+        for (code_off, literal) in [(TARGET_CODE_OFF, 0u8), (DONOR_CODE_OFF, 3u8)] {
+            dex[code_off..code_off + 2].copy_from_slice(&1u16.to_le_bytes());
+            write_u32(&mut dex, code_off + 12, 2);
+            dex[code_off + 16..code_off + 20].copy_from_slice(&[0x12, literal << 4, 0x0f, 0x00]);
+        }
+        dex
+    }
+
+    const TARGET_REF: DexMethodRef<'static> = DexMethodRef {
+        class: "LTarget;",
+        name: "target",
+        ret: "I",
+        params: &[],
+    };
+    const DONOR_REF: DexMethodRef<'static> = DexMethodRef {
+        class: "LDonor;",
+        name: "donor",
+        ret: "I",
+        params: &[],
+    };
+
+    #[test]
+    fn method_code_redirect_repoints_same_shape_same_width() {
+        let (mut dex, target, donor) = synthetic_redirect_fixture(0x100, 0x180);
+        let h = synthetic_shape_header();
+        let before_target_body = dex[0x100..0x114].to_vec();
+        let before_donor_body = dex[0x180..0x194].to_vec();
+
+        assert!(redirect_compatible_code_off(
+            &mut dex, &h, target, donor, "I", "I"
+        ));
+        assert_eq!(&dex[8..10], &encode_uleb128_u32(0x180).0[..2]);
+        assert_eq!(&dex[0x100..0x114], before_target_body);
+        assert_eq!(&dex[0x180..0x194], before_donor_body);
+    }
+
+    #[test]
+    fn method_code_redirect_refuses_shape_mismatch() {
+        let (mut dex, target, donor) = synthetic_redirect_fixture(0x100, 0x180);
+        let h = synthetic_shape_header();
+        dex[0x180 + 4..0x180 + 6].copy_from_slice(&1u16.to_le_bytes());
+        let before = dex.clone();
+
+        assert!(!redirect_compatible_code_off(
+            &mut dex, &h, target, donor, "I", "I"
+        ));
+        assert_eq!(dex, before);
+    }
+
+    #[test]
+    fn method_code_redirect_refuses_different_uleb_width() {
+        let (mut dex, target, donor) = synthetic_redirect_fixture(0x40, 0x100);
+        let h = synthetic_shape_header();
+        let before = dex.clone();
+
+        assert!(!redirect_compatible_code_off(
+            &mut dex, &h, target, donor, "I", "I"
+        ));
+        assert_eq!(dex, before);
+    }
+
+    #[test]
+    fn redirect_method_code_refuses_truncated_header() {
+        let mut dex = vec![0u8; 0x60];
+        let before = dex.clone();
+        assert!(!redirect_method_code(&mut dex, TARGET_REF, DONOR_REF).unwrap());
+        assert_eq!(dex, before);
+    }
+
+    #[test]
+    fn redirect_method_code_public_api_repoints_valid_fixture() {
+        let mut dex = synthetic_public_redirect_dex();
+        let before_len = dex.len();
+        assert!(redirect_method_code(&mut dex, TARGET_REF, DONOR_REF).unwrap());
+        assert_eq!(dex.len(), before_len);
+        assert_eq!(&dex[0x126..0x128], &encode_uleb128_u32(0x180).0[..2]);
+    }
+
+    #[test]
+    fn redirect_method_code_refuses_oversized_encoded_method_index() {
+        let mut dex = synthetic_public_redirect_dex();
+        dex[0x124..0x129].copy_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x10]);
+        let before = dex.clone();
+        assert!(redirect_method_code(&mut dex, TARGET_REF, DONOR_REF).is_err());
+        assert_eq!(dex, before);
+    }
+
+    #[test]
+    fn redirect_method_code_refuses_ambiguous_symbol() {
+        let mut dex = synthetic_public_redirect_dex();
+        write_u32(&mut dex, 0x58, 3);
+        let duplicate = dex[0x9c..0xa4].to_vec();
+        dex[0xac..0xb4].copy_from_slice(&duplicate);
+        let before = dex.clone();
+        assert!(!redirect_method_code(&mut dex, TARGET_REF, DONOR_REF).unwrap());
+        assert_eq!(dex, before);
+    }
+
+    #[test]
+    fn redirect_method_code_refuses_malformed_code_item_tail() {
+        let mut dex = synthetic_public_redirect_dex();
+        dex[0x186..0x188].copy_from_slice(&1u16.to_le_bytes());
+        let before = dex.clone();
+        assert!(!redirect_method_code(&mut dex, TARGET_REF, DONOR_REF).unwrap());
+        assert_eq!(dex, before);
+    }
+
+    #[test]
+    fn redirect_method_code_refuses_identical_and_missing_methods() {
+        let mut dex = synthetic_public_redirect_dex();
+        let before = dex.clone();
+        assert!(!redirect_method_code(&mut dex, TARGET_REF, TARGET_REF).unwrap());
+        let missing = DexMethodRef {
+            name: "missing",
+            ..TARGET_REF
+        };
+        assert!(!redirect_method_code(&mut dex, missing, DONOR_REF).unwrap());
+        assert_eq!(dex, before);
     }
 
     #[test]

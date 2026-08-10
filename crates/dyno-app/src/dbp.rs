@@ -42,13 +42,13 @@ use memchr::memmem;
 use serde::Deserialize;
 
 use crate::dex_patch::{
-    DexPoolSymbol, DexPoolSymbolKind, MethodCodeReplacement, MethodCodeTemplateSlot, NopAnchor,
-    force_field_const_bool, force_fragment_render_gone, force_invoke_const_bool,
+    DexMethodRef, DexPoolSymbol, DexPoolSymbolKind, MethodCodeReplacement, MethodCodeTemplateSlot,
+    NopAnchor, force_field_const_bool, force_fragment_render_gone, force_invoke_const_bool,
     force_invoke_const_int, force_method_broadcast_finish, force_method_return_bool,
     force_method_return_int, force_method_return_void, force_nop_anchored_invoke,
     force_preference_controller_hidden, force_remoteviews_gone, force_view_gone,
     parse_method_descriptor, patch_method_code, redirect_intent_action_to_broadcast,
-    resolve_dex_pool_symbol, validate_method_code_template_slots,
+    redirect_method_code, resolve_dex_pool_symbol, validate_method_code_template_slots,
 };
 use crate::ext4_helpers::{lookup_inode_at_path, open_ext4_volume, write_via_extents};
 use crate::fuck_lgsi::{
@@ -204,6 +204,18 @@ pub enum DbpOp {
         symbols: Vec<DbpCodeSymbol>,
         #[serde(default, rename = "replacement")]
         replacements: Vec<DbpCodeReplacement>,
+    },
+    /// Redirect one encoded method's `code_off` to the existing code item of
+    /// another symbolically selected, shape-compatible method.
+    MethodCodeRedirect {
+        partition: String,
+        file: String,
+        class: String,
+        method: String,
+        proto: String,
+        donor_class: String,
+        donor_method: String,
+        donor_proto: String,
     },
     /// Hide one exact field-backed SwitchPreference controller entry by
     /// rewriting its `displayPreference(PreferenceScreen)` body in place.
@@ -367,6 +379,7 @@ impl DbpOp {
             | DbpOp::MethodConstInt { partition, .. }
             | DbpOp::MethodNop { partition, .. }
             | DbpOp::MethodCodePatch { partition, .. }
+            | DbpOp::MethodCodeRedirect { partition, .. }
             | DbpOp::PreferenceControllerHide { partition, .. }
             | DbpOp::ResourceBool { partition, .. }
             | DbpOp::ResourceDimen { partition, .. }
@@ -389,6 +402,7 @@ impl DbpOp {
             | DbpOp::MethodConstInt { file, .. }
             | DbpOp::MethodNop { file, .. }
             | DbpOp::MethodCodePatch { file, .. }
+            | DbpOp::MethodCodeRedirect { file, .. }
             | DbpOp::PreferenceControllerHide { file, .. }
             | DbpOp::ResourceBool { file, .. }
             | DbpOp::ResourceDimen { file, .. }
@@ -637,6 +651,45 @@ pub fn load_dbp(path: &Path) -> Result<DbpDocument> {
                             symbol.name()
                         )));
                     }
+                }
+            }
+            DbpOp::MethodCodeRedirect {
+                class,
+                method,
+                proto,
+                donor_class,
+                donor_method,
+                donor_proto,
+                ..
+            } => {
+                for (label, class_name, method_name, method_proto) in [
+                    ("target", class, method, proto),
+                    ("donor", donor_class, donor_method, donor_proto),
+                ] {
+                    if !class_descriptor_is_valid(class_name)
+                        || method_name.is_empty()
+                        || !full_method_descriptor_is_valid(method_proto)
+                    {
+                        return Err(bail(format!(
+                            "method_code_redirect `{label}` must specify a valid class, method, and prototype"
+                        )));
+                    }
+                }
+                let target_ret = parse_method_descriptor(proto)
+                    .map(|(ret, _)| ret)
+                    .ok_or_else(|| bail("invalid method_code_redirect target prototype".into()))?;
+                let donor_ret = parse_method_descriptor(donor_proto)
+                    .map(|(ret, _)| ret)
+                    .ok_or_else(|| bail("invalid method_code_redirect donor prototype".into()))?;
+                if target_ret != donor_ret {
+                    return Err(bail(format!(
+                        "method_code_redirect target and donor return types must match (`{target_ret}` != `{donor_ret}`)"
+                    )));
+                }
+                if class == donor_class && method == donor_method && proto == donor_proto {
+                    return Err(bail(
+                        "method_code_redirect target and donor must be different methods".into(),
+                    ));
                 }
             }
             DbpOp::PreferenceControllerHide {
@@ -1415,6 +1468,37 @@ fn apply_one_op(dex: &mut [u8], op: &DbpOp) -> Result<bool> {
                 })
                 .collect();
             patch_method_code(dex, class, method, &ret, &param_refs, &code_replacements)
+        }
+        DbpOp::MethodCodeRedirect {
+            class,
+            method,
+            proto,
+            donor_class,
+            donor_method,
+            donor_proto,
+            ..
+        } => {
+            let (target_ret, target_params) = parse_method_descriptor(proto)
+                .ok_or_else(|| anyhow!("invalid descriptor `{proto}`"))?;
+            let (donor_ret, donor_params) = parse_method_descriptor(donor_proto)
+                .ok_or_else(|| anyhow!("invalid descriptor `{donor_proto}`"))?;
+            let target_param_refs: Vec<&str> = target_params.iter().map(String::as_str).collect();
+            let donor_param_refs: Vec<&str> = donor_params.iter().map(String::as_str).collect();
+            redirect_method_code(
+                dex,
+                DexMethodRef {
+                    class,
+                    name: method,
+                    ret: &target_ret,
+                    params: &target_param_refs,
+                },
+                DexMethodRef {
+                    class: donor_class,
+                    name: donor_method,
+                    ret: &donor_ret,
+                    params: &donor_param_refs,
+                },
+            )
         }
         DbpOp::PreferenceControllerHide {
             class,
@@ -2415,7 +2499,7 @@ value = false
         let sw = load_dbp(&patches_dir().join("debloat-setupwizard.dbp"))
             .expect("debloat-setupwizard.dbp");
         assert_eq!(sw.name, "debloat-setupwizard");
-        assert_eq!(sw.ops.len(), 8);
+        assert_eq!(sw.ops.len(), 10);
         let mut cloud_offline = false;
         let mut cloud_completed = false;
         let mut fixed_complete_on_create = false;
@@ -2424,6 +2508,7 @@ value = false
         let mut forced_non_commercial = false;
         let mut redirected_easysync = false;
         let mut skipped_lenovoid_entry = false;
+        let mut user_experience_variants = 0usize;
         for op in &sw.ops {
             match op {
                 // The cloud/Lenovo-ID gate: both forced so
@@ -2557,6 +2642,19 @@ value = false
                     assert_eq!(action, "com.zui.setupwizard.action.CLOUD_SKIP");
                     skipped_lenovoid_entry = true;
                 }
+                DbpOp::MethodCodePatch {
+                    class,
+                    method,
+                    proto,
+                    replacements,
+                    ..
+                } => {
+                    assert_eq!(class, "Lcom/zui/setupwizard/PrivacyAndSettingActivity;");
+                    assert_eq!(method, "initView");
+                    assert_eq!(proto, "()V");
+                    assert_eq!(replacements.len(), 1);
+                    user_experience_variants += 1;
+                }
                 _ => panic!("unexpected op in debloat-setupwizard"),
             }
         }
@@ -2568,8 +2666,9 @@ value = false
                 && forced_network_avail
                 && forced_non_commercial
                 && redirected_easysync
-                && skipped_lenovoid_entry,
-            "all eight setup-wizard ops must parse"
+                && skipped_lenovoid_entry
+                && user_experience_variants == 2,
+            "all ten setup-wizard ops must parse"
         );
         let gl =
             load_dbp(&patches_dir().join("show-google-lens.dbp")).expect("show-google-lens.dbp");
@@ -2605,12 +2704,15 @@ value = false
         let ds2 =
             load_dbp(&patches_dir().join("debloat-settings.dbp")).expect("debloat-settings.dbp");
         assert_eq!(ds2.name, "debloat-settings");
-        assert_eq!(ds2.ops.len(), 5);
+        assert_eq!(ds2.ops.len(), 9);
         let mut hide = false;
         let mut show = false;
         let mut hide_user_experience = false;
         let mut hotline_prc = false;
         let mut hotline_row = false;
+        let mut suggestion_complete = false;
+        let mut suggestion_finished = false;
+        let mut search_deindex_variants = 0usize;
         for op in &ds2.ops {
             match op {
                 DbpOp::MethodConstInt {
@@ -2661,6 +2763,64 @@ value = false
                         hotline_row = true;
                     }
                 }
+                DbpOp::MethodConstBool {
+                    class,
+                    method,
+                    proto,
+                    value,
+                    ..
+                } => {
+                    assert_eq!(
+                        class,
+                        "Lcom/lenovo/settings/suggestion/UserExperienceSuggestionActivity;"
+                    );
+                    assert_eq!(method, "isSuggestionComplete");
+                    assert_eq!(proto, "(Landroid/content/Context;)Z");
+                    assert!(*value);
+                    suggestion_complete = true;
+                }
+                DbpOp::MethodCodePatch {
+                    class,
+                    method,
+                    proto,
+                    replacements,
+                    ..
+                } => {
+                    assert_eq!(
+                        class,
+                        "Lcom/lenovo/settings/suggestion/UserExperienceSuggestionActivity;"
+                    );
+                    assert_eq!(method, "onCreate");
+                    assert_eq!(proto, "(Landroid/os/Bundle;)V");
+                    assert_eq!(replacements.len(), 1);
+                    suggestion_finished = true;
+                }
+                DbpOp::MethodCodeRedirect {
+                    class,
+                    method,
+                    proto,
+                    donor_class,
+                    donor_method,
+                    donor_proto,
+                    ..
+                } => {
+                    assert_eq!(
+                        class,
+                        "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;"
+                    );
+                    assert_eq!(method, "getAvailabilityStatus");
+                    assert_eq!(proto, "()I");
+                    assert_eq!(donor_proto, "()I");
+                    assert!(
+                        (donor_class
+                            == "Lcom/lenovo/settings/widget/UnsupportedPreferenceController;"
+                            && donor_method == "getAvailabilityStatus")
+                            || (donor_class
+                                == "Lcom/google/android/material/sidesheet/SideSheetDialog;"
+                                && donor_method == "getStateOnStart")
+                    );
+                    search_deindex_variants += 1;
+                }
                 _ => panic!("unexpected op in debloat-settings"),
             }
         }
@@ -2673,6 +2833,10 @@ value = false
         assert!(
             hotline_prc && hotline_row,
             "must flip the hotline region gate to ROW (isPrcVersion->false, isRowVersion->true)"
+        );
+        assert!(
+            suggestion_complete && suggestion_finished && search_deindex_variants == 2,
+            "must suppress, harden, and deindex the User Experience suggestion"
         );
 
         let qk = load_dbp(&patches_dir().join("disable-quick-kill.dbp"))
@@ -3214,6 +3378,323 @@ value = false
         }
     }
 
+    /// The two exact User Experience row shapes are mutually exclusive build
+    /// pins. Each supported APK must land exactly one and cleanly skip the
+    /// other. Optional `*_DEX_OUT` values are output directories.
+    #[test]
+    fn setupwizard_user_experience_row_lands_on_supported_builds() {
+        use sha2::{Digest, Sha256};
+
+        let doc = load_dbp(&patches_dir().join("debloat-setupwizard.dbp")).unwrap();
+        let ops: Vec<_> = doc
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    DbpOp::MethodCodePatch { class, method, .. }
+                        if class == "Lcom/zui/setupwizard/PrivacyAndSettingActivity;"
+                            && method == "initView"
+                )
+            })
+            .collect();
+        assert_eq!(ops.len(), 2, "one exact shape per supported build");
+
+        for (path_env, out_env, expected_len, expected_digest, expected_hits) in [
+            (
+                "DYNOBOX_ZUISETUPWIZARD_APK",
+                "DYNOBOX_ZUISETUPWIZARD_DEX_OUT",
+                28_232_715usize,
+                "FDD75DD679578E9FD6F05475229B28D48CEA7C4B86CAE726BBB8FD447E14E108",
+                [1usize, 0],
+            ),
+            (
+                "DYNOBOX_ZUISETUPWIZARD_ZUXOS183_APK",
+                "DYNOBOX_ZUISETUPWIZARD_ZUXOS183_DEX_OUT",
+                45_984_916usize,
+                "A8414B5624D82EE78EC81D911C094A8AC945196ACBF86B1EE6CF791E947C22C5",
+                [0usize, 1],
+            ),
+        ] {
+            let Ok(path) = std::env::var(path_env) else {
+                continue;
+            };
+            let apk = std::fs::read(path).expect("read setup-wizard APK");
+            assert_eq!(apk.len(), expected_len, "unexpected setup-wizard size");
+            let digest = Sha256::digest(&apk)
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            assert_eq!(digest, expected_digest, "unexpected setup-wizard digest");
+            let zip = crate::fuck_lgsi::parse_zip_central_directory(&apk).expect("parse APK");
+            let mut hits = [0usize; 2];
+            for entry in zip.entries.iter().filter(|entry| {
+                entry.name.ends_with(".dex")
+                    && entry.compression_method == 0
+                    && !entry.uses_data_descriptor
+                    && !entry.is_zip64
+                    && entry.data_start + entry.compressed_size <= apk.len()
+            }) {
+                let original = &apk[entry.data_start..entry.data_start + entry.compressed_size];
+                for (index, op) in ops.iter().enumerate() {
+                    let mut dex = original.to_vec();
+                    if apply_one_op(&mut dex, op).unwrap() {
+                        hits[index] += 1;
+                    }
+                }
+                let mut patched = original.to_vec();
+                let changed = ops
+                    .iter()
+                    .filter(|op| apply_one_op(&mut patched, op).unwrap())
+                    .count();
+                if changed > 0
+                    && let Ok(out) = std::env::var(out_env)
+                {
+                    crate::fuck_lgsi::recompute_dex_header_sums(&mut patched);
+                    std::fs::create_dir_all(&out).unwrap();
+                    std::fs::write(std::path::Path::new(&out).join(&entry.name), patched).unwrap();
+                }
+            }
+            assert_eq!(hits, expected_hits, "unexpected pinned row-op hits");
+        }
+    }
+
+    /// Report and assert per-op DEX landing counts for both debloat documents
+    /// on each pinned TB322 build. The `.063` fixture is read from its original
+    /// system image; `.183` uses the three decoded-system APK paths.
+    #[test]
+    fn debloat_setupwizard_and_settings_op_counts_on_supported_builds() {
+        fn read_system_apk(image: &Path, path: &str) -> Vec<u8> {
+            read_file_from_ext4(image, path)
+                .expect("read system image")
+                .unwrap_or_else(|| panic!("missing {path} in system image"))
+                .0
+        }
+
+        fn dex_landing_count(apk: &[u8], op: &DbpOp) -> usize {
+            let zip = crate::fuck_lgsi::parse_zip_central_directory(apk).expect("parse APK");
+            zip.entries
+                .iter()
+                .filter(|entry| {
+                    entry.name.ends_with(".dex")
+                        && entry.compression_method == 0
+                        && !entry.uses_data_descriptor
+                        && !entry.is_zip64
+                        && entry.data_start + entry.compressed_size <= apk.len()
+                })
+                .filter(|entry| {
+                    let mut dex =
+                        apk[entry.data_start..entry.data_start + entry.compressed_size].to_vec();
+                    apply_one_op(&mut dex, op).expect("apply op")
+                })
+                .count()
+        }
+
+        let mut fixtures: Vec<(&str, BTreeMap<&str, Vec<u8>>)> = Vec::new();
+        if let Ok(path) = std::env::var("DYNOBOX_ZUISETTINGS_SYSTEM_IMG") {
+            let image = Path::new(&path);
+            fixtures.push((
+                ".063",
+                BTreeMap::from([
+                    (
+                        "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk",
+                        read_system_apk(
+                            image,
+                            "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk",
+                        ),
+                    ),
+                    (
+                        "system/priv-app/ZuiSettings/ZuiSettings.apk",
+                        read_system_apk(image, "system/priv-app/ZuiSettings/ZuiSettings.apk"),
+                    ),
+                    (
+                        "system/priv-app/LenovoID/LenovoID.apk",
+                        read_system_apk(image, "system/priv-app/LenovoID/LenovoID.apk"),
+                    ),
+                ]),
+            ));
+        }
+        if let (Ok(setup), Ok(settings), Ok(lenovo_id)) = (
+            std::env::var("DYNOBOX_ZUISETUPWIZARD_ZUXOS183_APK"),
+            std::env::var("DYNOBOX_ZUISETTINGS_ZUXOS183_APK"),
+            std::env::var("DYNOBOX_LENOVOID_ZUXOS183_APK"),
+        ) {
+            fixtures.push((
+                ".183",
+                BTreeMap::from([
+                    (
+                        "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk",
+                        std::fs::read(setup).expect("read .183 setup wizard"),
+                    ),
+                    (
+                        "system/priv-app/ZuiSettings/ZuiSettings.apk",
+                        std::fs::read(settings).expect("read .183 settings"),
+                    ),
+                    (
+                        "system/priv-app/LenovoID/LenovoID.apk",
+                        std::fs::read(lenovo_id).expect("read .183 LenovoID"),
+                    ),
+                ]),
+            ));
+        }
+
+        let setup = load_dbp(&patches_dir().join("debloat-setupwizard.dbp")).unwrap();
+        let settings = load_dbp(&patches_dir().join("debloat-settings.dbp")).unwrap();
+        for (label, apks) in fixtures {
+            let setup_hits: Vec<_> = setup
+                .ops
+                .iter()
+                .map(|op| dex_landing_count(&apks[op.file()], op))
+                .collect();
+            let settings_hits: Vec<_> = settings
+                .ops
+                .iter()
+                .map(|op| dex_landing_count(&apks[op.file()], op))
+                .collect();
+            eprintln!("{label} debloat-setupwizard hits: {setup_hits:?}");
+            eprintln!("{label} debloat-settings hits: {settings_hits:?}");
+            let expected_setup = match label {
+                ".063" => [1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+                ".183" => [1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
+                _ => unreachable!(),
+            };
+            let expected_settings = match label {
+                ".063" => [1, 0, 1, 1, 0, 1, 1, 1, 1],
+                ".183" => [1, 1, 1, 1, 1, 0, 1, 1, 1],
+                _ => unreachable!(),
+            };
+            assert_eq!(setup_hits, expected_setup, "{label} setup-wizard hits");
+            assert_eq!(settings_hits, expected_settings, "{label} settings hits");
+        }
+    }
+
+    /// Apply the three new User Experience suppression ops to pinned real
+    /// ZuiSettings APK fixtures. `.063` may be read directly from its system
+    /// image so the canonical firmware dump need not be copied or modified.
+    #[test]
+    fn zuisettings_user_experience_ops_land_on_supported_builds() {
+        use sha2::{Digest, Sha256};
+
+        let doc = load_dbp(&patches_dir().join("debloat-settings.dbp")).unwrap();
+        let ops: Vec<_> = doc
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    DbpOp::MethodConstBool { class, method, .. }
+                        if class == "Lcom/lenovo/settings/suggestion/UserExperienceSuggestionActivity;"
+                            && method == "isSuggestionComplete"
+                ) || matches!(
+                    op,
+                    DbpOp::MethodCodePatch { class, method, .. }
+                        if class == "Lcom/lenovo/settings/suggestion/UserExperienceSuggestionActivity;"
+                            && method == "onCreate"
+                ) || matches!(
+                    op,
+                    DbpOp::MethodCodeRedirect { class, method, .. }
+                        if class == "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;"
+                            && method == "getAvailabilityStatus"
+                )
+            })
+            .collect();
+        assert_eq!(ops.len(), 4, "two build-pinned redirect donors");
+
+        let mut fixtures = Vec::new();
+        if let Ok(path) = std::env::var("DYNOBOX_ZUISETTINGS_APK") {
+            fixtures.push((".063", std::fs::read(path).expect("read .063 ZuiSettings")));
+        } else if let Ok(path) = std::env::var("DYNOBOX_ZUISETTINGS_SYSTEM_IMG") {
+            let (apk, _, _) = read_file_from_ext4(
+                std::path::Path::new(&path),
+                "system/priv-app/ZuiSettings/ZuiSettings.apk",
+            )
+            .expect("read .063 system image")
+            .expect("ZuiSettings.apk in .063 system image");
+            fixtures.push((".063", apk));
+        }
+        if let Ok(path) = std::env::var("DYNOBOX_ZUISETTINGS_ZUXOS183_APK") {
+            fixtures.push((".183", std::fs::read(path).expect("read .183 ZuiSettings")));
+        }
+
+        for (label, apk) in fixtures {
+            let (expected_len, expected_digest, out_env) = match label {
+                ".063" => (
+                    163_845_275usize,
+                    "B24D645809702109B9F9E8A4B79220F7290BC33C68C1C2F7230D092A82FE200E",
+                    "DYNOBOX_ZUISETTINGS_DEX_OUT",
+                ),
+                ".183" => (
+                    164_193_930usize,
+                    "C1D51003F93E8D954289ECF8FBBB9751B17176109D94159289BB93138FFE2ED9",
+                    "DYNOBOX_ZUISETTINGS_ZUXOS183_DEX_OUT",
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(apk.len(), expected_len, "unexpected {label} APK size");
+            let digest = Sha256::digest(&apk)
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            assert_eq!(digest, expected_digest, "unexpected {label} APK digest");
+            let zip = crate::fuck_lgsi::parse_zip_central_directory(&apk).expect("parse APK");
+            let mut hits = [0usize; 4];
+            let mut shared_body_rewrite_hits = 0usize;
+            for entry in zip.entries.iter().filter(|entry| {
+                entry.name.ends_with(".dex")
+                    && entry.compression_method == 0
+                    && !entry.uses_data_descriptor
+                    && !entry.is_zip64
+                    && entry.data_start + entry.compressed_size <= apk.len()
+            }) {
+                let original = &apk[entry.data_start..entry.data_start + entry.compressed_size];
+                let mut shared_body_probe = original.to_vec();
+                if force_method_return_int(
+                    &mut shared_body_probe,
+                    "Lcom/lenovo/settings/privacy/UserExperienceSwitchController;",
+                    "getAvailabilityStatus",
+                    "I",
+                    &[],
+                    3,
+                )
+                .unwrap()
+                {
+                    shared_body_rewrite_hits += 1;
+                }
+                for (index, op) in ops.iter().enumerate() {
+                    let mut dex = original.to_vec();
+                    if apply_one_op(&mut dex, op).unwrap() {
+                        hits[index] += 1;
+                    }
+                }
+                let mut patched = original.to_vec();
+                let changed = ops
+                    .iter()
+                    .filter(|op| apply_one_op(&mut patched, op).unwrap())
+                    .count();
+                if changed > 0
+                    && let Ok(out) = std::env::var(out_env)
+                {
+                    crate::fuck_lgsi::recompute_dex_header_sums(&mut patched);
+                    std::fs::create_dir_all(&out).unwrap();
+                    std::fs::write(std::path::Path::new(&out).join(&entry.name), patched).unwrap();
+                }
+            }
+            let expected_hits = match label {
+                ".063" => [1, 1, 0, 1],
+                ".183" => [1, 1, 1, 0],
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                hits, expected_hits,
+                "unexpected {label} User Experience hits"
+            );
+            assert_eq!(
+                shared_body_rewrite_hits, 0,
+                "{label} shared return-0 body must refuse in-place rewriting"
+            );
+        }
+    }
+
     /// Apply the bundled debloat-settings ops to the real ZuiSettings dexes.
     /// Set `DYNOBOX_ZUISETTINGS_DEX_DIR`; optionally
     /// `DYNOBOX_ZUISETTINGS_DEX_OUT` to dump patched dexes for disassembly.
@@ -3265,7 +3746,10 @@ value = false
             user_experience_landed, 1,
             "UserExperienceSwitchController visibility override should land exactly once"
         );
-        assert_eq!(landed, 5, "all five debloat-settings ops should land");
+        assert_eq!(
+            landed, 8,
+            "eight build-compatible debloat-settings ops should land"
+        );
     }
 
     /// The deduplicated-code-item guard: forcing the "Service hotline"
@@ -3501,6 +3985,7 @@ value = false
                     "both complete-screen lifecycle gates must be patched"
                 );
             }
+            let mut user_experience_variant_hits = 0usize;
             for op in ops {
                 let mut dex_hits = 0usize;
                 let mut redirect_sites = 0usize;
@@ -3651,6 +4136,19 @@ value = false
                         );
                     }
                 }
+                if matches!(
+                    op,
+                    DbpOp::MethodCodePatch { class, method, .. }
+                        if class == "Lcom/zui/setupwizard/PrivacyAndSettingActivity;"
+                            && method == "initView"
+                ) {
+                    assert!(
+                        dex_hits <= 1,
+                        "a pinned row variant may land in at most one dex"
+                    );
+                    user_experience_variant_hits += dex_hits;
+                    continue;
+                }
                 assert_eq!(
                     dex_hits, 1,
                     "{file} op must land in exactly one dex: {op:?}"
@@ -3686,6 +4184,12 @@ value = false
                         "PsLoginWizardActivity.onCreate rewrites once"
                     );
                 }
+            }
+            if file == "system/priv-app/ZUISetupWizardExtPRC/ZUISetupWizardExtPRC.apk" {
+                assert_eq!(
+                    user_experience_variant_hits, 1,
+                    "exactly one pinned User Experience row variant must land"
+                );
             }
         }
     }
