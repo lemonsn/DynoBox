@@ -589,8 +589,15 @@ while still advancing the setup wizard.
   `PhoneWindowManager.getResolvedLongPressOnPowerBehavior()` returns the
   setting-driven value (do not force that resolver to a constant, e.g. via a
   `method_const_int` on `getResolvedLongPressOnPowerBehavior`, or long-press is
-  pinned to one behavior regardless of the setting). ZuiSystemUI needs no change
-  (stock AOSP global actions + assist). The boot default
+  pinned to one behavior regardless of the setting). A `method_code_patch` in
+  `services.jar` also repairs ZUXOS's inconsistent reboot state: when
+  `assistant` still names an app but `voice_interaction_service` is empty, VIMS
+  uses the selected assistant component as its runtime source of truth. The
+  existing service-info check binds service assistants, leaves activity-only
+  assistants on their activity launch path, and keeps an empty assistant
+  disabled. ZuiSystemUI needs no change (stock AOSP global actions + assist).
+  This remains instruction-shape-pinned, so an unmatched firmware is reported
+  as a skipped operation. The boot default
   (`config_longPressOnPowerBehavior` = 5 = Assistant) is left as-is — changing it
   means editing framework-res.apk's `resources.arsc`, which DynoBox's arsc walker
   doesn't parse.

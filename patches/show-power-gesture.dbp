@@ -1,7 +1,7 @@
 # Show the press-and-hold power gesture setting on PRC builds.
 
 name = "show-power-gesture"
-description = "Show the Press-and-hold-power gesture setting on PRC (isRowVersion in PowerMenuPreferenceController). Requires --fuck-lgsi; do not force getResolvedLongPressOnPowerBehavior to a constant."
+description = "Show the Press-and-hold-power gesture setting on PRC and bind the retained assistant when ZUXOS clears its voice-interaction setting across reboot. Requires --fuck-lgsi; do not force getResolvedLongPressOnPowerBehavior to a constant."
 
 [[op]]
 kind = "invoke_const_bool"
@@ -11,3 +11,34 @@ scan_class = "Lcom/android/settings/gestures/PowerMenuPreferenceController;"
 target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
 target_method = "isRowVersion"
 value = true
+
+# ZUXOS can retain Settings.Secure.ASSISTANT while persisting an empty
+# VOICE_INTERACTION_SERVICE. AOSP treats that empty string as an explicit opt-out,
+# so VIMS never creates its active implementation after reboot. Use the selected
+# assistant component as the runtime source of truth: service components bind as
+# normal, activity-only assistants fail the existing service-info check and keep
+# their activity launch path, and an empty assistant still disables interaction.
+# This remains instruction-shape-pinned; an unmatched build is reported as a
+# skipped operation instead of receiving a partial patch.
+[[op]]
+kind = "method_code_patch"
+partition = "system"
+file = "system/framework/services.jar"
+class = "Lcom/android/server/voiceinteraction/VoiceInteractionManagerService$VoiceInteractionManagerServiceStub;"
+method = "switchImplementationIfNeededNoTracingLocked"
+proto = "(Z)V"
+
+[[op.symbol]]
+name = "voice_interaction_service"
+kind = "string"
+value = "voice_interaction_service"
+
+[[op.symbol]]
+name = "assistant"
+kind = "string"
+value = "assistant"
+
+[[op.replacement]]
+from = "1a 01 ${voice_interaction_service:u16}"
+to = "1a 01 ${assistant:u16}"
+expected = 1

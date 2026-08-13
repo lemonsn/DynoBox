@@ -3045,7 +3045,7 @@ value = false
         let pgs = load_dbp(&patches_dir().join("show-power-gesture.dbp"))
             .expect("show-power-gesture.dbp");
         assert_eq!(pgs.name, "show-power-gesture");
-        assert_eq!(pgs.ops.len(), 1);
+        assert_eq!(pgs.ops.len(), 2);
         match &pgs.ops[0] {
             DbpOp::InvokeConstBool {
                 file,
@@ -3062,6 +3062,35 @@ value = false
                 assert!(*value, "must force isRowVersion -> true");
             }
             _ => panic!("show-power-gesture must use invoke_const_bool"),
+        }
+        match &pgs.ops[1] {
+            DbpOp::MethodCodePatch {
+                partition,
+                file,
+                class,
+                method,
+                proto,
+                symbols,
+                replacements,
+            } => {
+                assert_eq!(partition, "system");
+                assert_eq!(file, "system/framework/services.jar");
+                assert_eq!(
+                    class,
+                    "Lcom/android/server/voiceinteraction/VoiceInteractionManagerService$VoiceInteractionManagerServiceStub;"
+                );
+                assert_eq!(method, "switchImplementationIfNeededNoTracingLocked");
+                assert_eq!(proto, "(Z)V");
+                assert!(!symbols.is_empty());
+                assert_eq!(replacements.len(), 1);
+                assert_eq!(replacements[0].expected, 1);
+                assert_eq!(
+                    replacements[0].from,
+                    "1a 01 ${voice_interaction_service:u16}"
+                );
+                assert_eq!(replacements[0].to, "1a 01 ${assistant:u16}");
+            }
+            _ => panic!("show-power-gesture op[1] must use method_code_patch"),
         }
 
         let dt = load_dbp(&patches_dir().join("debloat-theme.dbp")).expect("debloat-theme.dbp");
@@ -3152,6 +3181,92 @@ value = false
         }
         assert_eq!(systemui_ops, 2);
         assert_eq!(launcher_ops, 1);
+    }
+
+    /// Apply the reboot-state voice-interaction recovery to every configured
+    /// supported ZUXOS services.jar fixture. Matching `*_DEX_OUT` values
+    /// optionally write the patched DEX entry for disassembly.
+    #[test]
+    fn bundled_show_power_gesture_recovery_lands_on_real_services_jar() {
+        use sha2::{Digest, Sha256};
+
+        fn land_on_jar(jar: &[u8], op: &DbpOp, out: Option<&str>) -> (usize, Vec<String>) {
+            let zip =
+                crate::fuck_lgsi::parse_zip_central_directory(jar).expect("parse services.jar zip");
+            let mut landed = 0usize;
+            let mut changed_entries = Vec::new();
+            for entry in zip.entries.iter().filter(|entry| {
+                entry.name.ends_with(".dex")
+                    && entry.compression_method == 0
+                    && !entry.uses_data_descriptor
+                    && !entry.is_zip64
+                    && entry.data_start + entry.compressed_size <= jar.len()
+            }) {
+                let original = &jar[entry.data_start..entry.data_start + entry.compressed_size];
+                let mut dex = original.to_vec();
+                if apply_one_op(&mut dex, op).unwrap() {
+                    landed += 1;
+                    assert_eq!(dex.len(), original.len(), "DEX size changed");
+                    assert_ne!(dex, original, "reported landing without a byte change");
+                    crate::fuck_lgsi::recompute_dex_header_sums(&mut dex);
+                    changed_entries.push(entry.name.clone());
+                    if let Some(path) = out {
+                        std::fs::write(path, &dex).expect("write patched services DEX");
+                    }
+                }
+            }
+            (landed, changed_entries)
+        }
+
+        let doc = load_dbp(&patches_dir().join("show-power-gesture.dbp")).unwrap();
+        let op = doc
+            .ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    op,
+                    DbpOp::MethodCodePatch { class, method, .. }
+                        if class.contains("VoiceInteractionManagerServiceStub;")
+                            && method == "switchImplementationIfNeededNoTracingLocked"
+                )
+            })
+            .expect("switchImplementationIfNeededNoTracingLocked method_code_patch");
+
+        for (jar_env, out_env, expected_len, expected_digest, build) in [
+            (
+                "DYNOBOX_POWER_GESTURE_ZUXOS183_SERVICES_JAR",
+                "DYNOBOX_POWER_GESTURE_ZUXOS183_DEX_OUT",
+                25_090_736,
+                "7867D0B1B7106B05CC0B8F4C6E1274028C7C72EE6FBF68109B6BD7D0CC95CD56",
+                "ZUXOS 183",
+            ),
+            (
+                "DYNOBOX_POWER_GESTURE_ZUXOS294_SERVICES_JAR",
+                "DYNOBOX_POWER_GESTURE_ZUXOS294_DEX_OUT",
+                25_102_804,
+                "946CDD9E3944A6319BD91BD0E2D3D4D51D56F7F6DD1DF405E4875F3C5BD2864B",
+                "ZUXOS 294",
+            ),
+        ] {
+            let Ok(path) = std::env::var(jar_env) else {
+                continue;
+            };
+            let jar = std::fs::read(path).expect("read services.jar");
+            assert_eq!(jar.len(), expected_len, "unexpected {build} services size");
+            let digest = Sha256::digest(&jar)
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            assert_eq!(
+                digest, expected_digest,
+                "unexpected {build} services digest"
+            );
+
+            let output = std::env::var(out_env).ok();
+            let (landed, changed_entries) = land_on_jar(&jar, op, output.as_deref());
+            assert_eq!(landed, 1, "{build} VIMS recovery must land exactly once");
+            assert_eq!(changed_entries, ["classes3.dex"]);
+        }
     }
 
     #[test]
