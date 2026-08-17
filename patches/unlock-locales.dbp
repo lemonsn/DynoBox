@@ -14,6 +14,16 @@ value = false
 [[op]]
 kind = "invoke_const_bool"
 partition = "system"
+file = "system/priv-app/PenService/PenService.apk"
+scan_class = "Lcom/lenovo/pen/bt/ui/freewrite/language/LanguageActivity;"
+scan_method = "updateUiByMode"
+target_class = "Lcom/lenovo/pen/cap/util/SystemProps;"
+target_method = "isPRC"
+value = false
+
+[[op]]
+kind = "invoke_const_bool"
+partition = "system"
 file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
 scan_class = "Lcom/android/settings/localepicker/LocaleListEditor;"
 target_class = "Lcom/lenovo/common/utils/LenovoUtils;"

@@ -2411,7 +2411,29 @@ value = false
         assert_eq!(cl.ops.len(), 3);
         let zs = load_dbp(&patches_dir().join("unlock-locales.dbp")).expect("unlock-locales.dbp");
         assert_eq!(zs.name, "unlock-locales");
-        assert_eq!(zs.ops.len(), 13);
+        assert_eq!(zs.ops.len(), 14);
+        assert!(zs.ops.iter().any(|op| {
+            matches!(
+                op,
+                DbpOp::InvokeConstBool {
+                    partition,
+                    file,
+                    scan_class,
+                    scan_method,
+                    target_class,
+                    target_method,
+                    value,
+                    ..
+                } if partition == "system"
+                    && file == "system/priv-app/PenService/PenService.apk"
+                    && scan_class
+                        == "Lcom/lenovo/pen/bt/ui/freewrite/language/LanguageActivity;"
+                    && scan_method.as_deref() == Some("updateUiByMode")
+                    && target_class == "Lcom/lenovo/pen/cap/util/SystemProps;"
+                    && target_method == "isPRC"
+                    && !value
+            )
+        }));
         let wu = load_dbp(&patches_dir().join("unlock-wifi.dbp")).expect("unlock-wifi.dbp");
         assert_eq!(wu.name, "unlock-wifi");
         assert_eq!(wu.ops.len(), 2);
@@ -4657,8 +4679,14 @@ value = false
             return;
         };
         let doc = load_dbp(&patches_dir().join("unlock-locales.dbp")).unwrap();
+        let ops: Vec<&DbpOp> = doc
+            .ops
+            .iter()
+            .filter(|op| op.file() == "system/priv-app/ZuiSettings/ZuiSettings.apk")
+            .collect();
+        assert_eq!(ops.len(), 13);
         let dir = std::path::Path::new(&dir);
-        let mut op_hits = vec![0usize; doc.ops.len()];
+        let mut op_hits = vec![0usize; ops.len()];
         for name in [
             "classes.dex",
             "classes2.dex",
@@ -4670,7 +4698,7 @@ value = false
             let Ok(mut dex) = std::fs::read(dir.join(name)) else {
                 continue;
             };
-            for (op_index, op) in doc.ops.iter().enumerate() {
+            for (op_index, op) in ops.iter().enumerate() {
                 if apply_one_op(&mut dex, op).unwrap() {
                     op_hits[op_index] += 1;
                 }
@@ -4680,6 +4708,41 @@ value = false
             op_hits.iter().all(|&hits| hits == 1),
             "every unlock-locales op must land in exactly one dex; per-op hits: {op_hits:?}"
         );
+    }
+
+    /// Apply the bundled PenService locale op to the real PenService dexes.
+    /// Set `DYNOBOX_PENSERVICE_DEX_DIR`.
+    #[test]
+    fn bundled_unlock_locales_penservice_lands_on_real_dex() {
+        let Ok(dir) = std::env::var("DYNOBOX_PENSERVICE_DEX_DIR") else {
+            return;
+        };
+        let doc = load_dbp(&patches_dir().join("unlock-locales.dbp")).unwrap();
+        let ops: Vec<&DbpOp> = doc
+            .ops
+            .iter()
+            .filter(|op| op.file() == "system/priv-app/PenService/PenService.apk")
+            .collect();
+        assert_eq!(ops.len(), 1);
+        let dir = std::path::Path::new(&dir);
+        let mut op_hits = vec![0usize; ops.len()];
+        for name in [
+            "classes.dex",
+            "classes2.dex",
+            "classes3.dex",
+            "classes4.dex",
+            "classes5.dex",
+        ] {
+            let Ok(mut dex) = std::fs::read(dir.join(name)) else {
+                continue;
+            };
+            for (op_index, op) in ops.iter().enumerate() {
+                if apply_one_op(&mut dex, op).unwrap() {
+                    op_hits[op_index] += 1;
+                }
+            }
+        }
+        assert_eq!(op_hits, vec![1], "PenService locale op must land once");
     }
 
     #[test]
