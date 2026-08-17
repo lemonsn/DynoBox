@@ -983,10 +983,15 @@ pub struct MethodCodeReplacement<'a> {
 /// operation is abandoned without mutating `dex` if any one does not. The
 /// final body is decoded again and every ordinary branch target is required to
 /// land on an instruction boundary. Code-item size and structural fields are
-/// never changed, R8-shared code items are refused, and an invoke immediately
-/// consumed by `move-result*` cannot be overwritten. This is not a register-type
-/// dataflow verifier: callers must still prove all replacement register values
-/// are verifier-compatible at every later use and control-flow merge.
+/// never changed and R8-shared code items are refused. An invoke immediately
+/// consumed by `move-result*` cannot be overwritten unless the same replacement
+/// also covers that consumer; the final body is then checked so every
+/// `move-result*` still immediately follows a compatible result-producing
+/// instruction. Changed `invoke-custom` result pairs are conservatively
+/// refused because their call-site return type is not resolved here.
+/// This is not a register-type dataflow verifier: callers must still prove all
+/// replacement register values are verifier-compatible at every later use and
+/// control-flow merge.
 pub fn patch_method_code(
     dex: &mut [u8],
     class_descriptor: &str,
@@ -1027,7 +1032,8 @@ pub fn patch_method_code(
         .filter(|&end| end <= dex.len())
         .ok_or_else(|| anyhow!("method instruction range exceeds dex"))?;
 
-    let mut working = dex[insns_start..insns_end].to_vec();
+    let original = &dex[insns_start..insns_end];
+    let mut working = original.to_vec();
     for replacement in replacements {
         validate_method_code_replacement(replacement)?;
         if replacement.from.len() > working.len() {
@@ -1062,6 +1068,9 @@ pub fn patch_method_code(
     }
 
     validate_method_control_flow(&working)?;
+    if !validate_move_result_producers(dex, &h, original, &working)? {
+        return Ok(false);
+    }
     dex[insns_start..insns_end].copy_from_slice(&working);
     Ok(true)
 }
@@ -1087,7 +1096,10 @@ fn replacement_overwrites_consumed_invoke(
         .into_iter()
         .filter(|&off| off >= replacement_off && off < replacement_end)
     {
-        if !matches!(insns[invoke_off], 0x6e..=0x72 | 0x74..=0x78) {
+        if !matches!(
+            insns[invoke_off],
+            0x24 | 0x25 | 0x6e..=0x72 | 0x74..=0x78 | 0xfa..=0xfd
+        ) {
             continue;
         }
         let invoke_width = instruction_width_bytes(insns, invoke_off)
@@ -1097,7 +1109,8 @@ fn replacement_overwrites_consumed_invoke(
             .filter(|&end| end <= replacement_end)
             .ok_or_else(|| anyhow!("method-code replacement splits an invoke"))?;
         let replacement_invoke_off = invoke_off - replacement_off;
-        if invoke_result_is_consumed(insns, invoke_off, invoke_width)
+        if invoke_end == replacement_end
+            && invoke_result_is_consumed(insns, invoke_off, invoke_width)
             && insns[invoke_off..invoke_end]
                 != replacement[replacement_invoke_off..replacement_invoke_off + invoke_width]
         {
@@ -1502,6 +1515,104 @@ fn validate_method_control_flow(insns: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DexResultKind {
+    Void,
+    Scalar,
+    Wide,
+    Object,
+}
+
+fn type_descriptor_at(dex: &[u8], h: &DexHeader, type_idx: usize) -> Result<Option<String>> {
+    if type_idx >= h.type_ids_size {
+        return Ok(None);
+    }
+    let string_idx = read_u32_le(dex, h.type_ids_off + type_idx * 4);
+    dex_walker::read_string_at_idx(dex, h.string_ids_size, h.string_ids_off, string_idx)
+}
+
+fn proto_result_kind(dex: &[u8], h: &DexHeader, proto_idx: usize) -> Result<Option<DexResultKind>> {
+    if proto_idx >= h.proto_ids_size {
+        return Ok(None);
+    }
+    let return_type_idx = usize::try_from(read_u32_le(dex, h.proto_ids_off + proto_idx * 12 + 4))
+        .map_err(|_| anyhow!("dex return type index exceeds address space"))?;
+    let Some(descriptor) = type_descriptor_at(dex, h, return_type_idx)? else {
+        return Ok(None);
+    };
+    Ok(match descriptor.as_str() {
+        "V" => Some(DexResultKind::Void),
+        "J" | "D" => Some(DexResultKind::Wide),
+        value if value.starts_with('L') || value.starts_with('[') => Some(DexResultKind::Object),
+        "Z" | "B" | "S" | "C" | "I" | "F" => Some(DexResultKind::Scalar),
+        _ => None,
+    })
+}
+
+fn producer_result_kind(
+    dex: &[u8],
+    h: &DexHeader,
+    insns: &[u8],
+    pc: usize,
+) -> Result<Option<DexResultKind>> {
+    let opcode = insns[pc];
+    if matches!(opcode, 0x24 | 0x25) {
+        return Ok(Some(DexResultKind::Object));
+    }
+    let proto_idx = match opcode {
+        0x6e..=0x72 | 0x74..=0x78 => {
+            let method_idx = usize::from(read_code_unit(insns, pc + 2).unwrap_or(u16::MAX));
+            if method_idx >= h.method_ids_size {
+                return Ok(None);
+            }
+            usize::from(read_u16_le(dex, h.method_ids_off + method_idx * 8 + 2))
+        }
+        0xfa | 0xfb => usize::from(read_code_unit(insns, pc + 6).unwrap_or(u16::MAX)),
+        // Resolving invoke-custom's encoded call-site prototype is deliberately
+        // outside this size-preserving patch primitive.
+        0xfc | 0xfd => return Ok(None),
+        _ => return Ok(None),
+    };
+    proto_result_kind(dex, h, proto_idx)
+}
+
+fn validate_move_result_producers(
+    dex: &[u8],
+    h: &DexHeader,
+    original: &[u8],
+    working: &[u8],
+) -> Result<bool> {
+    let boundaries = instruction_boundaries(working)?;
+    let original_boundaries = instruction_boundaries(original)?;
+    let mut previous_pc = None;
+    for &pc in boundaries.iter().filter(|&&pc| pc < working.len()) {
+        let opcode = working[pc];
+        if matches!(opcode, 0x0a..=0x0c) {
+            let Some(producer_pc) = previous_pc else {
+                return Ok(false);
+            };
+            let pair_end = pc + 2;
+            let pair_unchanged = original_boundaries.contains(&producer_pc)
+                && original_boundaries.contains(&pc)
+                && pair_end <= original.len()
+                && original[producer_pc..pair_end] == working[producer_pc..pair_end];
+            if !pair_unchanged {
+                let expected = match opcode {
+                    0x0a => DexResultKind::Scalar,
+                    0x0b => DexResultKind::Wide,
+                    0x0c => DexResultKind::Object,
+                    _ => unreachable!(),
+                };
+                if producer_result_kind(dex, h, working, producer_pc)? != Some(expected) {
+                    return Ok(false);
+                }
+            }
+        }
+        previous_pc = Some(pc);
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -3305,6 +3416,138 @@ mod tests {
 
         let discarded = &insns[..8];
         assert!(!replacement_overwrites_consumed_invoke(discarded, 0, &replacement).unwrap());
+
+        let covered_consumer = [
+            0x12, 0x02, // const/4 v2, #0
+            0x13, 0x04, 0x08, 0x00, // const/16 v4, #8
+            0x00, 0x00, // nop
+            0x00, 0x00, // replace the move-result too
+        ];
+        assert!(!replacement_overwrites_consumed_invoke(&insns, 0, &covered_consumer).unwrap());
+
+        let filled_array = [
+            0x24, 0x20, 0x34, 0x12, 0x10, 0x00, // filled-new-array {v0,v1}
+            0x0c, 0x02, // move-result-object v2
+        ];
+        let remove_filled_array = [0x12, 0x02, 0x00, 0x00, 0x00, 0x00];
+        assert!(
+            replacement_overwrites_consumed_invoke(&filled_array, 0, &remove_filled_array).unwrap()
+        );
+    }
+
+    #[test]
+    fn method_code_result_flow_checks_changed_producer_types() {
+        let header = DexHeader {
+            string_ids_size: 4,
+            string_ids_off: 0,
+            type_ids_size: 4,
+            type_ids_off: 16,
+            proto_ids_size: 4,
+            proto_ids_off: 32,
+            field_ids_size: 0,
+            field_ids_off: 0,
+            method_ids_size: 4,
+            method_ids_off: 80,
+            class_defs_size: 0,
+            class_defs_off: 0,
+        };
+        let mut dex = vec![0u8; 128];
+        for (index, descriptor) in ["I", "V", "J", "Ljava/lang/Object;"].iter().enumerate() {
+            let string_off = dex.len();
+            dex.push(u8::try_from(descriptor.len()).unwrap());
+            dex.extend_from_slice(descriptor.as_bytes());
+            dex.push(0);
+            dex[index * 4..index * 4 + 4]
+                .copy_from_slice(&u32::try_from(string_off).unwrap().to_le_bytes());
+            dex[16 + index * 4..20 + index * 4]
+                .copy_from_slice(&u32::try_from(index).unwrap().to_le_bytes());
+            dex[36 + index * 12..40 + index * 12]
+                .copy_from_slice(&u32::try_from(index).unwrap().to_le_bytes());
+            dex[82 + index * 8..84 + index * 8]
+                .copy_from_slice(&u16::try_from(index).unwrap().to_le_bytes());
+        }
+
+        let invoke = |method_idx: u16, result_opcode: u8, register_byte: u8| {
+            let [lo, hi] = method_idx.to_le_bytes();
+            [
+                0x71,
+                register_byte,
+                lo,
+                hi,
+                0x00,
+                0x00,
+                result_opcode,
+                0x00,
+                0x0e,
+                0x00,
+            ]
+        };
+        let original = invoke(0, 0x0a, 0x00);
+
+        let changed_scalar = invoke(0, 0x0a, 0x10);
+        assert!(validate_move_result_producers(&dex, &header, &original, &changed_scalar).unwrap());
+        let changed_wide = invoke(2, 0x0b, 0x00);
+        assert!(validate_move_result_producers(&dex, &header, &original, &changed_wide).unwrap());
+        let changed_object = invoke(3, 0x0c, 0x00);
+        assert!(validate_move_result_producers(&dex, &header, &original, &changed_object).unwrap());
+
+        let void_with_result = invoke(1, 0x0a, 0x00);
+        assert!(
+            !validate_move_result_producers(&dex, &header, &original, &void_with_result).unwrap()
+        );
+        let wide_with_scalar_result = invoke(2, 0x0a, 0x00);
+        assert!(
+            !validate_move_result_producers(&dex, &header, &original, &wide_with_scalar_result)
+                .unwrap()
+        );
+        let dangling = [
+            0x12, 0x00, // const/4 v0, #0
+            0x00, 0x00, // nop
+            0x00, 0x00, // nop
+            0x0a, 0x00, // dangling move-result v0
+            0x0e, 0x00, // return-void
+        ];
+        assert!(!validate_move_result_producers(&dex, &header, &original, &dangling).unwrap());
+
+        let original_array = invoke(3, 0x0c, 0x00);
+        let filled_array = [
+            0x24, 0x00, 0x00, 0x00, 0x00, 0x00, // filled-new-array {}
+            0x0c, 0x00, // move-result-object v0
+            0x0e, 0x00, // return-void
+        ];
+        assert!(
+            validate_move_result_producers(&dex, &header, &original_array, &filled_array).unwrap()
+        );
+
+        let original_polymorphic = [
+            0xfa, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // proto@0 -> I
+            0x0a, 0x00, // move-result v0
+            0x0e, 0x00, // return-void
+        ];
+        let object_polymorphic = [
+            0xfa, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, // proto@3 -> Object
+            0x0c, 0x00, // move-result-object v0
+            0x0e, 0x00, // return-void
+        ];
+        assert!(
+            validate_move_result_producers(
+                &dex,
+                &header,
+                &original_polymorphic,
+                &object_polymorphic,
+            )
+            .unwrap()
+        );
+
+        let custom = [
+            0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, // invoke-custom {}
+            0x0a, 0x00, // move-result v0
+            0x0e, 0x00, // return-void
+        ];
+        assert!(validate_move_result_producers(&dex, &header, &custom, &custom).unwrap());
+        let mut changed_custom = custom;
+        changed_custom[1] = 0x10;
+        assert!(!validate_move_result_producers(&dex, &header, &custom, &changed_custom).unwrap());
     }
 
     fn synthetic_redirect_fixture(

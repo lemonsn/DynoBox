@@ -59,7 +59,8 @@ pub struct PlusPatchRecord {
 #[derive(Debug, Clone)]
 pub struct PlusFileRecord {
     pub partition: String,
-    /// Path of the patched APK inside the partition image.
+    /// Path of the matched target inside the partition image. A record with
+    /// zero applied ops means the file existed but no exact patch site landed.
     pub file: String,
     pub ops_applied: usize,
     pub ops_skipped: usize,
@@ -485,7 +486,12 @@ fn push_plus_section(out: &mut String, pl: &PlusRecord) {
             out.push_str(&esc(&f.partition));
             out.push_str(" / ");
             out.push_str(&esc(display_name(&f.file)));
-            out.push_str("</code></td><td class='to'>");
+            out.push_str("</code>");
+            if f.ops_applied == 0 && f.ops_skipped > 0 {
+                out.push_str("<br><span class='empty'>Target found; no operations applied</span>");
+            }
+            out.push_str("</td><td class='");
+            out.push_str(if f.ops_applied > 0 { "to'>" } else { "empty'>" });
             out.push_str(&f.ops_applied.to_string());
             out.push_str("</td><td class='");
             out.push_str(if f.ops_skipped > 0 { "skipped'>" } else { "'>" });
@@ -691,6 +697,39 @@ mod tests {
         assert!(!html.contains(r"D:\Downloads"));
         assert!(!html.contains(r"C:\Git"));
         assert!(!html.contains(r"D:\staging"));
+    }
+
+    #[test]
+    fn render_html_distinguishes_missing_targets_from_unmatched_sites() {
+        let r = PipelineReport {
+            plus: Some(PlusRecord {
+                patches: vec![
+                    PlusPatchRecord {
+                        name: "missing-target".to_string(),
+                        source: "missing-target.dbp".to_string(),
+                        files: Vec::new(),
+                    },
+                    PlusPatchRecord {
+                        name: "unmatched-sites".to_string(),
+                        source: "unmatched-sites.dbp".to_string(),
+                        files: vec![PlusFileRecord {
+                            partition: "system".to_string(),
+                            file: "system/priv-app/ZuiLauncher/ZuiLauncher.apk".to_string(),
+                            ops_applied: 0,
+                            ops_skipped: 1,
+                            patched_entries: Vec::new(),
+                        }],
+                    },
+                ],
+                verity: Vec::new(),
+            }),
+            ..Default::default()
+        };
+
+        let html = r.render_html();
+        assert_eq!(html.matches("No matching files").count(), 1);
+        assert!(html.contains("system / ZuiLauncher.apk"));
+        assert!(html.contains("Target found; no operations applied"));
     }
 
     #[test]

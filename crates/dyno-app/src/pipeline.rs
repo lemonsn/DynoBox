@@ -2739,21 +2739,21 @@ where
                             events,
                             MessageLevel::Warning,
                             format!(
-                                "--plus {source}: target {partition}:{} matched no exact sites for {} op(s) (already patched or incompatible firmware)",
+                                "--plus {source}: target {partition}:{} applied none of {} op(s) (no exact site or refused by safety validation)",
                                 r.file, r.ops_skipped
                             ),
                         );
-                        continue;
+                    } else {
+                        message(
+                            events,
+                            MessageLevel::Info,
+                            format!(
+                                "[plus] {source} → {partition}:{}: {} op(s) applied, {} skipped (verity deferred)",
+                                r.file, r.ops_applied, r.ops_skipped
+                            ),
+                        );
+                        partition_modified = true;
                     }
-                    message(
-                        events,
-                        MessageLevel::Info,
-                        format!(
-                            "[plus] {source} → {partition}:{}: {} op(s) applied, {} skipped (verity deferred)",
-                            r.file, r.ops_applied, r.ops_skipped
-                        ),
-                    );
-                    partition_modified = true;
                     file_records.push(ReportPlusFileRecord {
                         partition: partition.clone(),
                         file: r.file,
@@ -2766,11 +2766,11 @@ where
                     dirty_partitions.insert(partition.clone(), img_path);
                 }
             }
-            if file_records.is_empty() {
+            if file_records.iter().all(|file| file.ops_applied == 0) {
                 let reason = if target_files_found == 0 {
                     "matched no target files"
                 } else {
-                    "found its target files, but no operations matched (already patched or incompatible firmware)"
+                    "found its target files, but applied no operations (no exact site or refused by safety validation)"
                 };
                 message(
                     events,

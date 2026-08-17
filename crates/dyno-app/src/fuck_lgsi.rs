@@ -1675,7 +1675,7 @@ pub(crate) mod dex_walker {
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 0xC0 */ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 1, 1, 1, /* 0xD0 */ 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
         /* 0xE0 */ 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 0xF0 */ 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 2, 2,
+        0, 0, 0, 0, 0, 0, 4, 4, 3, 3, 2, 2,
     ];
 
     #[cfg(test)]
@@ -1736,6 +1736,10 @@ pub(crate) mod dex_walker {
             assert_eq!(DEX_INSN_WIDTH_UNITS[0x70], 3); // invoke-direct
             assert_eq!(DEX_INSN_WIDTH_UNITS[0x71], 3); // invoke-static
             assert_eq!(DEX_INSN_WIDTH_UNITS[0x73], 0); // unused
+            assert_eq!(DEX_INSN_WIDTH_UNITS[0xFA], 4); // invoke-polymorphic
+            assert_eq!(DEX_INSN_WIDTH_UNITS[0xFB], 4); // invoke-polymorphic/range
+            assert_eq!(DEX_INSN_WIDTH_UNITS[0xFC], 3); // invoke-custom
+            assert_eq!(DEX_INSN_WIDTH_UNITS[0xFD], 3); // invoke-custom/range
         }
     }
 }
