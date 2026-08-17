@@ -2447,6 +2447,32 @@ value = false
             }
             _ => panic!("unlock-wifi second op must neutralize Lenovo init country mapping"),
         }
+        let le = load_dbp(&patches_dir().join("fix-leaudio.dbp")).expect("fix-leaudio.dbp");
+        assert_eq!(le.name, "fix-leaudio");
+        assert_eq!(le.ops.len(), 1);
+        match &le.ops[0] {
+            DbpOp::TextReplace {
+                partition,
+                file,
+                from,
+                to,
+                all,
+            } => {
+                assert_eq!(partition, "system_ext");
+                assert_eq!(file, "etc/build.prop");
+                assert_eq!(
+                    from,
+                    "ro.bluetooth.leaudio.le_audio_connection_by_default=false\n"
+                );
+                assert_eq!(
+                    to,
+                    "ro.bluetooth.leaudio.le_audio_connection_by_default=true\n\n"
+                );
+                assert!(!all);
+                assert_eq!(from.len(), to.len());
+            }
+            _ => panic!("fix-leaudio must pin system_ext build.prop"),
+        }
         let gs = load_dbp(&patches_dir().join("enable-google-services.dbp"))
             .expect("enable-google-services.dbp");
         assert_eq!(gs.name, "enable-google-services");

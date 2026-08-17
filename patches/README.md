@@ -437,6 +437,10 @@ while still advancing the setup wizard.
   `system.img:/system/build.prop` property with
   `ro.product.countrycode=US`. This avoids patching the compressed Mainline
   Wi-Fi APEX.
+* **`fix-leaudio.dbp`** — set
+  `system_ext.img:/etc/build.prop`'s
+  `ro.bluetooth.leaudio.le_audio_connection_by_default` property to `true`,
+  enabling LE Audio connections by default.
 * **`enable-google-services.dbp`** — keep Google services enabled on PRC builds:
   * force `GoogleServicesPreferenceController.getAvailabilityStatus()` → `0`
     (`AVAILABLE`) so the ZuiSettings "Google services" menu appears regardless
