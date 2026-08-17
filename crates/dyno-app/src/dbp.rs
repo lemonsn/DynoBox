@@ -2409,9 +2409,9 @@ value = false
             load_dbp(&patches_dir().join("debloat-launcher.dbp")).expect("debloat-launcher.dbp");
         assert_eq!(cl.name, "debloat-launcher");
         assert_eq!(cl.ops.len(), 3);
-        let zs = load_dbp(&patches_dir().join("unlock-locale.dbp")).expect("unlock-locale.dbp");
-        assert_eq!(zs.name, "unlock-locale");
-        assert_eq!(zs.ops.len(), 22);
+        let zs = load_dbp(&patches_dir().join("unlock-locales.dbp")).expect("unlock-locales.dbp");
+        assert_eq!(zs.name, "unlock-locales");
+        assert_eq!(zs.ops.len(), 13);
         let wu = load_dbp(&patches_dir().join("unlock-wifi.dbp")).expect("unlock-wifi.dbp");
         assert_eq!(wu.name, "unlock-wifi");
         assert_eq!(wu.ops.len(), 2);
@@ -4652,13 +4652,13 @@ value = false
     /// Apply the bundled ZuiSettings ops to the real ZuiSettings dexes.
     /// Set `DYNOBOX_ZUISETTINGS_DEX_DIR`.
     #[test]
-    fn bundled_unlock_locale_lands_on_real_dex() {
+    fn bundled_unlock_locales_lands_on_real_dex() {
         let Ok(dir) = std::env::var("DYNOBOX_ZUISETTINGS_DEX_DIR") else {
             return;
         };
-        let doc = load_dbp(&patches_dir().join("unlock-locale.dbp")).unwrap();
+        let doc = load_dbp(&patches_dir().join("unlock-locales.dbp")).unwrap();
         let dir = std::path::Path::new(&dir);
-        let mut landed = 0usize;
+        let mut op_hits = vec![0usize; doc.ops.len()];
         for name in [
             "classes.dex",
             "classes2.dex",
@@ -4670,15 +4670,15 @@ value = false
             let Ok(mut dex) = std::fs::read(dir.join(name)) else {
                 continue;
             };
-            for op in &doc.ops {
+            for (op_index, op) in doc.ops.iter().enumerate() {
                 if apply_one_op(&mut dex, op).unwrap() {
-                    landed += 1;
+                    op_hits[op_index] += 1;
                 }
             }
         }
         assert!(
-            landed >= 10,
-            "expected most ZuiSettings ops to land, got {landed}"
+            op_hits.iter().all(|&hits| hits == 1),
+            "every unlock-locales op must land in exactly one dex; per-op hits: {op_hits:?}"
         );
     }
 

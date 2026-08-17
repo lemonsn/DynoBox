@@ -1,6 +1,6 @@
 # Unlock the full language picker and regional preferences in PRC ZuiSettings.
 
-name = "unlock-locale"
+name = "unlock-locales"
 description = "PRC ZuiSettings language picker + Regional preferences -> ROW."
 
 [[op]]
@@ -27,15 +27,6 @@ partition = "system"
 file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
 scan_class = "Lcom/android/settings/localepicker/LocaleListEditor$7;"
 target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isPrcVersion"
-value = false
-
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/android/settings/localepicker/LocaleListEditor$7;"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
 target_method = "isRowVersion"
 value = true
 
@@ -82,16 +73,6 @@ file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
 scan_class = "Lcom/lenovo/common/utils/LenovoUtils;"
 scan_method = "getChangedName"
 target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isPrcVersion"
-value = false
-
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-scan_method = "getChangedName"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
 target_method = "isRowVersion"
 value = true
 
@@ -108,28 +89,10 @@ value = false
 kind = "invoke_const_bool"
 partition = "system"
 file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/android/settings/regionalpreferences/RegionalPreferencesCategoryController;"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isRowVersion"
-value = true
-
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
 scan_class = "Lcom/android/settings/regionalpreferences/RegionalPreferencesController;"
 target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
 target_method = "isPrcVersion"
 value = false
-
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/android/settings/regionalpreferences/RegionalPreferencesController;"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isRowVersion"
-value = true
 
 [[op]]
 kind = "invoke_const_bool"
@@ -140,15 +103,7 @@ target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
 target_method = "isPrcVersion"
 value = false
 
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/android/settings/regionalpreferences/RegionPickerFragment$1;"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isRowVersion"
-value = true
-
+# R8 shares this code item with FirstDayOfWeekItemFragment$2 on ZUXOS 1.5.10.183.
 [[op]]
 kind = "invoke_const_bool"
 partition = "system"
@@ -162,43 +117,7 @@ value = false
 kind = "invoke_const_bool"
 partition = "system"
 file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/android/settings/regionalpreferences/TemperatureUnitFragment$2;"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isRowVersion"
-value = true
-
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
 scan_class = "Lcom/android/settings/regionalpreferences/MeasurementSystemItemFragment$2;"
 target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
 target_method = "isPrcVersion"
 value = false
-
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/android/settings/regionalpreferences/MeasurementSystemItemFragment$2;"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isRowVersion"
-value = true
-
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/android/settings/regionalpreferences/FirstDayOfWeekItemFragment$2;"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isPrcVersion"
-value = false
-
-[[op]]
-kind = "invoke_const_bool"
-partition = "system"
-file = "system/priv-app/ZuiSettings/ZuiSettings.apk"
-scan_class = "Lcom/android/settings/regionalpreferences/FirstDayOfWeekItemFragment$2;"
-target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
-target_method = "isRowVersion"
-value = true

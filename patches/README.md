@@ -7,7 +7,7 @@ Pass one or more with the `--plus` resign option:
 ```sh
 dynobox resign  -i <in> -o <out> -k <key> --plus patches/debloat-launcher.dbp
 dynobox unpack  -i <in> --resign -k <key> --plus a.dbp --plus b.dbp
-dynobox apply   -i <in> resign  -k <key> --plus patches/unlock-locale.dbp  ota.zip
+dynobox apply   -i <in> resign  -k <key> --plus patches/unlock-locales.dbp  ota.zip
 ```
 
 Archive ops force a method, invocation result, or compiled resource value to a
@@ -425,7 +425,7 @@ while still advancing the setup wizard.
   global search → ROW branch; no first-run recommended widgets/apps). Forces
   `Utilities.isZuiRow()` + `GraphicsUtils.isZuiRow()` → `true` and
   `FeatureFlags.isIsShowPrcGlobalSearch()` → `false`.
-* **`unlock-locale.dbp`** — make the PRC ZuiSettings behave like a ROW
+* **`unlock-locales.dbp`** — make the PRC ZuiSettings behave like a ROW
   build (full language picker + previously-hidden Regional preferences
   category). Forces `LenovoUtils.isPrcVersion()` → `false` /
   `isRowVersion()` → `true` at the call sites inside the affected classes.
