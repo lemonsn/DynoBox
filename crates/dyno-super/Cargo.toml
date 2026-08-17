@@ -14,7 +14,7 @@ dynobox-xml.workspace = true
 regex = "1.13.1"
 sha2 = "0.11.0"
 tracing.workspace = true
-zerocopy = { version = "0.8.55", features = ["derive"] }
+zerocopy = { version = "0.8.56", features = ["derive"] }
 
 [dev-dependencies]
 tempfile.workspace = true
