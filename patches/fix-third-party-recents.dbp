@@ -1,18 +1,9 @@
 name = "fix-third-party-recents"
-description = "Fix SystemUI and ZuiLauncher Recents transitions with a third-party default launcher."
+description = "Fix Recents with third-party launchers."
 
-# Mirror ZuiRecentsFix's GoingToOverview guard inside the OEM synthetic
-# Consumer body shape whose removed entry log supplies an animator-cancel code
-# cave. Subsequent replacements route the
-# GoingToOverview branch through an ArrayList.isEmpty() guard: an empty list
-# records prevVisibleFreeforms + mLauncherState and returns, while a non-empty
-# list rejoins the byte-identical OEM hideAllTasks path. The final three
-# replacements give each surviving debug call a path-correct String tag after
-# the original tag-initializing prologue becomes the code cave.
 [[op]]
 kind = "method_code_patch"
 partition = "system_ext"
-# Same image-root path as enable-circle-to-search.dbp.
 file = "priv-app/ZuiSystemUI/ZuiSystemUI.apk"
 class = "Lcom/android/wm/shell/recents/RecentTasksController$$ExternalSyntheticLambda6;"
 method = "accept"
@@ -197,16 +188,9 @@ to = "1a 00 ${home_log:u16} 71 20 ${log_d:u16} 05 00"
 from = "6e 10 ${sb_to_string:u16} 00 00 0c 00 71 20 ${log_d:u16} 01 00"
 to = "6e 10 ${sb_to_string:u16} 00 00 0c 00 71 20 ${log_d:u16} 02 00"
 
-# Mirror the finishInner before-hook. The entry jumps into a second code cave
-# made from the removed OVF debug message. Only a "requested" finish whose
-# toHome argument conflicts with the controller's normal, non-empty pausing
-# state is rewritten to false. The Xposed module's PackageManager lookup is
-# intentionally omitted: the internal inconsistency is the actual fault
-# signature and needs no new dex ids or code units.
 [[op]]
 kind = "method_code_patch"
 partition = "system_ext"
-# Same image-root path as enable-circle-to-search.dbp.
 file = "priv-app/ZuiSystemUI/ZuiSystemUI.apk"
 class = "Lcom/android/wm/shell/recents/RecentsTransitionHandler$RecentsController;"
 method = "finishInner"
@@ -379,22 +363,9 @@ ${state:u16} 39 03 0d 00 54 13 ${pausing_tasks:u16} 38 03 09 00 6e 10 ${array_li
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 """
 
-# Port the ZuiLauncher hook into RecentsActivity.M()V. RecentsActivity is
-# the fallback overview used when Home and Overview differ. Query the existing
-# ActivityManagerWrapper for the current top task: keep startHome for a missing
-# task, a HOME task, or RecentsActivity itself; otherwise suppress the stale
-# startHome callback that steals focus after launching a third-party app.
-#
-# The allowed path intentionally calls the existing startHomeIntentSafely
-# overload with a null Bundle. The Xposed hook would proceed through the OEM
-# RemoteTransition setup, but that animation wrapper cannot coexist with the
-# guard inside this fixed 52-code-unit body. Functional Home navigation remains;
-# only the OEM remote animation is omitted on this fallback path.
-# Symbolic DEX references keep the body portable when pool layouts move.
 [[op]]
 kind = "method_code_patch"
 partition = "system"
-# Same image-root path as debloat-launcher.dbp.
 file = "system/priv-app/ZuiLauncher/ZuiLauncher.apk"
 class = "Lcom/android/quickstep/RecentsActivity;"
 method = "M"

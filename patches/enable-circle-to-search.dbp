@@ -1,7 +1,6 @@
-# Enable Google Circle to Search on PRC builds.
 
 name = "enable-circle-to-search"
-description = "Enable Google Circle to Search (long-press Home) on PRC by clearing the ROW/PRC gates in ZuiSystemUI + ZuiSettings and declaring the Google features."
+description = "Enable Circle to Search."
 
 [[op]]
 kind = "invoke_const_bool"

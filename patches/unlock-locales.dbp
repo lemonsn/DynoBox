@@ -1,7 +1,6 @@
-# Unlock the full language picker and regional preferences in PRC ZuiSettings.
 
 name = "unlock-locales"
-description = "PRC ZuiSettings language picker + Regional preferences -> ROW."
+description = "Use ROW language and region behavior."
 
 [[op]]
 kind = "invoke_const_bool"
@@ -103,7 +102,6 @@ target_class = "Lcom/lenovo/common/utils/LenovoUtils;"
 target_method = "isPrcVersion"
 value = false
 
-# R8 shares this code item with FirstDayOfWeekItemFragment$2 on ZUXOS 1.5.10.183.
 [[op]]
 kind = "invoke_const_bool"
 partition = "system"

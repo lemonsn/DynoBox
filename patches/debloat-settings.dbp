@@ -1,8 +1,6 @@
-# Hide LeCloud, Service hotline, and every live User Experience surface;
-# suppress its setup suggestion and show AOSP Accounts & sync.
 
 name = "debloat-settings"
-description = "Hide the ZuiSettings LeCloud tile, Service hotline, and User Experience preference and search result; suppress its deferred-setup suggestion and always show AOSP Accounts & sync."
+description = "Remove ZUI Settings extras."
 
 [[op]]
 kind = "method_const_int"
@@ -29,7 +27,6 @@ method = "isSuggestionComplete"
 proto = "(Landroid/content/Context;)Z"
 value = true
 
-# A stale suggestion or direct launch must close instead of drawing the dialog.
 [[op]]
 kind = "method_code_patch"
 partition = "system"

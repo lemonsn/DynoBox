@@ -1,7 +1,6 @@
-# Show the Google services menu and prevent first-boot package disabling.
 
 name = "enable-google-services"
-description = "Show the ZuiSettings Google services menu and skip first-boot GMS package disable on PRC."
+description = "Enable Google services."
 
 [[op]]
 kind = "method_const_int"

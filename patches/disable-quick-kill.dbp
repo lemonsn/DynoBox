@@ -1,7 +1,6 @@
-# Disable ZMC quick-kill memory reclamation.
 
 name = "disable-quick-kill"
-description = "Disable the ZMC quick-kill reclaim path (zuimemory.use_quick_kill -> false in ZuiMemCleanerConfig.xml)."
+description = "Disable ZMC quick kill."
 
 [[op]]
 kind = "text_replace"

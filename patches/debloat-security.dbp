@@ -1,7 +1,6 @@
-# Hide ZuiSecurity surfaces and route app permissions to AOSP.
 
 name = "debloat-security"
-description = "Hide/disable ZuiSecurity's security surfaces (antivirus, autostart, permission manager, URL-security, app-recommendation, install-scan) across ZuiSettings/ZuiSecurity/ZuiPackageInstaller and route app permissions to AOSP."
+description = "Remove ZUI security surfaces."
 
 [[op]]
 kind = "method_nop"

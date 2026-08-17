@@ -1,7 +1,6 @@
-# Drop FontActivity online catalog while keeping Local fonts.
 
 name = "debloat-theme"
-description = "Hide ZuiHomeSettings FontActivity online catalog while keeping Local fonts."
+description = "Keep local fonts only."
 
 [[op]]
 kind = "invoke_const_bool"

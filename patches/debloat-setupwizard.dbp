@@ -1,7 +1,6 @@
-# Hide User Experience, skip Lenovo ID and EasySync, and keep Home usable.
 
 name = "debloat-setupwizard"
-description = "Hide the non-functional User Experience row, skip the Lenovo ID entry screen and removed XuiEasySync restore activity, and keep the final home button visible without the Vantage widget."
+description = "Remove ZUI setup extras."
 
 [[op]]
 kind = "invoke_const_bool"
@@ -138,9 +137,6 @@ target_class = "Lcom/zui/setupwizard/common/AppHelper;"
 target_method = "isSupportCCS"
 value = true
 
-# onEnterEnd checks the same gate again after the page transition. Keep it out
-# of the legacy FloatWindowService path, whose hidden button waits for a removed
-# launcher-widget broadcast.
 [[op]]
 kind = "invoke_const_bool"
 partition = "system"

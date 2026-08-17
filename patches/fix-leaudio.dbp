@@ -1,5 +1,5 @@
 name = "fix-leaudio"
-description = "Enable LE Audio connections by default."
+description = "Enable LE Audio by default."
 
 [[op]]
 kind = "text_replace"

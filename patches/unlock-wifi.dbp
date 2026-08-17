@@ -1,7 +1,6 @@
-# Keep PRC Wi-Fi on the US regulatory domain.
 
 name = "unlock-wifi"
-description = "Keep PRC Wi-Fi on a US regulatory domain by pinning the Wi-Fi country input."
+description = "Use the US Wi-Fi region."
 
 [[op]]
 kind = "text_replace"

@@ -1,7 +1,6 @@
-# Use ROW launcher search behavior and hide first-run recommendations.
 
 name = "debloat-launcher"
-description = "Force ZuiLauncher home search + first-run recommendations to ROW."
+description = "Use ROW launcher behavior."
 
 [[op]]
 kind = "method_const_bool"

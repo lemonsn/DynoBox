@@ -1,7 +1,6 @@
-# Show the Google Lens camera button instead of ZUI AI Lens.
 
 name = "show-google-lens"
-description = "Show the Google Lens camera button (instead of ZUI AI Lens) on PRC ZuiCamera."
+description = "Show Google Lens in ZuiCamera."
 
 [[op]]
 kind = "invoke_const_bool"
