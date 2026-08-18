@@ -45,10 +45,11 @@ use crate::dex_patch::{
     DexMethodRef, DexPoolSymbol, DexPoolSymbolKind, MethodCodeReplacement, MethodCodeTemplateSlot,
     NopAnchor, force_field_const_bool, force_fragment_render_gone, force_invoke_const_bool,
     force_invoke_const_int, force_method_broadcast_finish, force_method_return_bool,
-    force_method_return_int, force_method_return_void, force_nop_anchored_invoke,
-    force_preference_controller_hidden, force_remoteviews_gone, force_view_gone,
-    parse_method_descriptor, patch_method_code, redirect_intent_action_to_broadcast,
-    redirect_method_code, resolve_dex_pool_symbol, validate_method_code_template_slots,
+    force_method_return_const_string, force_method_return_int, force_method_return_void,
+    force_nop_anchored_invoke, force_preference_controller_hidden, force_remoteviews_gone,
+    force_view_gone, parse_method_descriptor, patch_method_code,
+    redirect_intent_action_to_broadcast, redirect_method_code, resolve_dex_pool_symbol,
+    validate_method_code_template_slots,
 };
 use crate::ext4_helpers::{lookup_inode_at_path, open_ext4_volume, write_via_extents};
 use crate::fuck_lgsi::{
@@ -66,6 +67,10 @@ fn default_int_proto() -> String {
 
 fn default_void_proto() -> String {
     "()V".to_string()
+}
+
+fn default_string_proto() -> String {
+    "()Ljava/lang/String;".to_string()
 }
 
 fn default_on_create_bundle_proto() -> String {
@@ -180,6 +185,18 @@ pub enum DbpOp {
         #[serde(default = "default_int_proto")]
         proto: String,
         value: i32,
+    },
+    /// Force a `Ljava/lang/String;`-returning method body to an existing
+    /// constant string for every caller. The string must already be in the
+    /// dex string pool, so no DEX id is added.
+    MethodConstString {
+        partition: String,
+        file: String,
+        class: String,
+        method: String,
+        #[serde(default = "default_string_proto")]
+        proto: String,
+        value: String,
     },
     /// Neutralize a `void` method: rewrite its body to `return-void` for every
     /// caller (used to disable init/register hooks at their source).
@@ -377,6 +394,7 @@ impl DbpOp {
         match self {
             DbpOp::MethodConstBool { partition, .. }
             | DbpOp::MethodConstInt { partition, .. }
+            | DbpOp::MethodConstString { partition, .. }
             | DbpOp::MethodNop { partition, .. }
             | DbpOp::MethodCodePatch { partition, .. }
             | DbpOp::MethodCodeRedirect { partition, .. }
@@ -400,6 +418,7 @@ impl DbpOp {
         match self {
             DbpOp::MethodConstBool { file, .. }
             | DbpOp::MethodConstInt { file, .. }
+            | DbpOp::MethodConstString { file, .. }
             | DbpOp::MethodNop { file, .. }
             | DbpOp::MethodCodePatch { file, .. }
             | DbpOp::MethodCodeRedirect { file, .. }
@@ -484,6 +503,19 @@ pub fn load_dbp(path: &Path) -> Result<DbpDocument> {
             }
             DbpOp::MethodConstInt { proto, .. } | DbpOp::InvokeConstInt { proto, .. } => {
                 validate_method_proto(proto, "I", "integer (`I`)", &bail)?;
+            }
+            DbpOp::MethodConstString { proto, value, .. } => {
+                validate_method_proto(
+                    proto,
+                    "Ljava/lang/String;",
+                    "string (`Ljava/lang/String;`)",
+                    &bail,
+                )?;
+                if value.is_empty() {
+                    return Err(bail(
+                        "method_const_string `value` must not be empty".to_string(),
+                    ));
+                }
             }
             DbpOp::MethodNop { proto, .. } => {
                 validate_method_proto(proto, "V", "void (`V`)", &bail)?;
@@ -1417,6 +1449,18 @@ fn apply_one_op(dex: &mut [u8], op: &DbpOp) -> Result<bool> {
                 .ok_or_else(|| anyhow!("invalid descriptor `{proto}`"))?;
             let param_refs: Vec<&str> = params.iter().map(String::as_str).collect();
             force_method_return_int(dex, class, method, &ret, &param_refs, *value)
+        }
+        DbpOp::MethodConstString {
+            class,
+            method,
+            proto,
+            value,
+            ..
+        } => {
+            let (ret, params) = parse_method_descriptor(proto)
+                .ok_or_else(|| anyhow!("invalid descriptor `{proto}`"))?;
+            let param_refs: Vec<&str> = params.iter().map(String::as_str).collect();
+            force_method_return_const_string(dex, class, method, &ret, &param_refs, value)
         }
         DbpOp::MethodNop {
             class,
@@ -2470,14 +2514,13 @@ value = false
             _ => panic!("unlock-wifi second op must neutralize Lenovo init country mapping"),
         }
         match &wu.ops[2] {
-            DbpOp::MethodCodePatch {
+            DbpOp::MethodConstString {
                 partition,
                 file,
                 class,
                 method,
                 proto,
-                replacements,
-                ..
+                value,
             } => {
                 assert_eq!(partition, "system");
                 assert_eq!(
@@ -2487,7 +2530,7 @@ value = false
                 assert_eq!(class, "Lcom/zui/translator/utils/MicrosoftApiKey;");
                 assert_eq!(method, "getCountryCode");
                 assert_eq!(proto, "()Ljava/lang/String;");
-                assert_eq!(replacements.len(), 1);
+                assert_eq!(value, "CN");
             }
             _ => panic!("unlock-wifi third op must pin the translator country code"),
         }
@@ -4392,7 +4435,7 @@ value = false
         let op = doc
             .ops
             .iter()
-            .find(|op| matches!(op, DbpOp::MethodCodePatch { .. }))
+            .find(|op| matches!(op, DbpOp::MethodConstString { .. }))
             .expect("unlock-wifi must carry the translator country-code op");
         let apk = std::fs::read(&path).expect("read apk");
         let zip = crate::fuck_lgsi::parse_zip_central_directory(&apk).expect("zip");

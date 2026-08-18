@@ -72,6 +72,26 @@ instructions with `nop`.
 | `proto`  | no       | JVM method descriptor; defaults to `()I`       |
 | `value`  | yes      | signed 32-bit integer                          |
 
+### `method_const_string`
+
+Force a `Ljava/lang/String;`-returning method body to an existing constant
+string. Rewrites the body to `const-string v0, "value"; return-object v0`
+(nop-padded). The string must already be in the target dex's string pool, so
+no DEX id is added and the file length never changes.
+
+| field    | required | meaning                                                   |
+|----------|----------|-----------------------------------------------------------|
+| `class`  | yes      | JVM class descriptor                                      |
+| `method` | yes      | method name                                               |
+| `proto`  | no       | JVM method descriptor; must return `Ljava/lang/String;`; defaults to `()Ljava/lang/String;` |
+| `value`  | yes      | the returned string; must already exist in the dex pool   |
+
+Because the rewrite starts at the method entry and uses `v0`, it is
+independent of how a given build allocated registers inside the original
+body, unlike a byte-pinned `method_code_patch`. It is refused when the string
+is absent, its index needs `const-string/jumbo`, the code item is
+R8-deduplicated, or the body is too small.
+
 ### `method_nop`
 
 Neutralize a **void** method for every caller: rewrite its body to `return-void`

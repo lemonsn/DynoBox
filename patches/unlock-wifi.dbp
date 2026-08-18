@@ -17,30 +17,10 @@ from = "ro.product.countrycode"
 to = "ro.product.countrycodE"
 
 [[op]]
-kind = "method_code_patch"
+kind = "method_const_string"
 partition = "system"
 file = "system/priv-app/LeVoiceCaptionApp/LeVoiceCaptionApp.apk"
 class = "Lcom/zui/translator/utils/MicrosoftApiKey;"
 method = "getCountryCode"
 proto = "()Ljava/lang/String;"
-
-[[op.symbol]]
-name = "countrycode_prop"
-kind = "string"
-value = "ro.product.countrycode"
-
-[[op.symbol]]
-name = "sysprop_get"
-kind = "method"
-class = "Lcom/zui/translator/utils/SystemPropertiesUtil;"
-method = "get"
-proto = "(Ljava/lang/String;)Ljava/lang/String;"
-
-[[op.symbol]]
-name = "cn"
-kind = "string"
 value = "CN"
-
-[[op.replacement]]
-from = "1a 00 ${countrycode_prop:u16} 71 10 ${sysprop_get:u16} 00 00 0c 00"
-to = "1a 00 ${cn:u16} 11 00 00 00 00 00 00 00"

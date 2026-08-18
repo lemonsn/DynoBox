@@ -1753,6 +1753,108 @@ fn rewrite_method_body_const_int(dex: &mut [u8], code_off: usize, value: i32) ->
     Ok(true)
 }
 
+/// Force the `Ljava/lang/String;`-returning method
+/// `class.method(params...)Ljava/lang/String;` to always return the constant
+/// `value`. The string must already be in this dex's string pool, so no new
+/// DEX id is created and the file length never changes.
+///
+/// Unlike a byte-pinned `method_code_patch`, this is independent of how the
+/// build allocated registers inside the original body: the rewrite starts at
+/// the method entry and uses `v0`, which every method with at least one
+/// register has.
+///
+/// Returns `false` (safe no-op) when the class/method isn't in this dex, the
+/// string isn't in the pool, the index needs `const-string/jumbo`, the code
+/// item is deduplicated, or the body cannot hold the replacement.
+pub fn force_method_return_const_string(
+    dex: &mut [u8],
+    class_descriptor: &str,
+    method_name: &str,
+    ret_descriptor: &str,
+    params: &[&str],
+    value: &str,
+) -> Result<bool> {
+    if ret_descriptor != "Ljava/lang/String;" {
+        return Err(anyhow!(
+            "force_method_return_const_string requires a Ljava/lang/String; return, got `{ret_descriptor}`"
+        ));
+    }
+    let Some(h) = read_dex_header(dex) else {
+        return Ok(false);
+    };
+    let Some(string_idx) = resolve_dex_pool_symbol(dex, DexPoolSymbol::String(value))? else {
+        return Ok(false);
+    };
+    // `const-string` carries a u16 operand; a wider index would need
+    // `const-string/jumbo`, which is a different length. Refuse instead.
+    let Ok(string_idx) = u16::try_from(string_idx) else {
+        return Ok(false);
+    };
+    let Some(code_off) = find_method_code_off(
+        dex,
+        &h,
+        class_descriptor,
+        method_name,
+        ret_descriptor,
+        params,
+    )?
+    else {
+        return Ok(false);
+    };
+    // Refuse a deduplicated (shared) code item (see `code_off_is_shared`).
+    if code_off_is_shared(dex, &h, code_off)? {
+        return Ok(false);
+    }
+    rewrite_method_body_const_string(dex, code_off, string_idx)
+}
+
+/// Rewrite the body at `code_off` to `const-string v0, string@idx` followed by
+/// `return-object v0`, nop-padded to the covered instruction boundary.
+///
+/// `tries_size` and any trailing try/handler bytes are deliberately left
+/// untouched: `const-string` can throw only on a missing string (impossible
+/// for a resolved pool index) and the following `return-object` cannot, so the
+/// original try region becomes unreachable dead code while the `code_item`
+/// keeps its exact size and ART's contiguous verifier walk stays in sync.
+fn rewrite_method_body_const_string(
+    dex: &mut [u8],
+    code_off: usize,
+    string_idx: u16,
+) -> Result<bool> {
+    if code_off + 16 > dex.len() {
+        return Ok(false);
+    }
+    // registers_size @ code_off+0 (u16). `const-string v0` needs v0 to exist.
+    if read_u16_le(dex, code_off) < 1 {
+        return Ok(false);
+    }
+    let insns_size = read_u32_le(dex, code_off + 12) as usize;
+    let insns_off = code_off + 16;
+    let insns_end = match insns_off.checked_add(insns_size.checked_mul(2).unwrap_or(0)) {
+        Some(e) if e <= dex.len() => e,
+        _ => return Ok(false),
+    };
+
+    let mut replacement = [0u8; 6];
+    replacement[0] = 0x1a; // const-string vAA, string@BBBB
+    replacement[1] = 0x00; // v0
+    replacement[2..4].copy_from_slice(&string_idx.to_le_bytes());
+    replacement[4] = 0x11; // return-object vAA
+    replacement[5] = 0x00; // v0
+
+    let Some(cover_end) = cover_whole_instructions(dex, insns_off, insns_end, replacement.len())
+    else {
+        return Ok(false);
+    };
+
+    let b = &mut dex[insns_off..cover_end];
+    b[..replacement.len()].copy_from_slice(&replacement);
+    for pad in b.iter_mut().skip(replacement.len()) {
+        *pad = 0x00; // nop
+    }
+    Ok(true)
+}
+
 /// Force the `V`-returning method `class.method(params...)V` to do nothing:
 /// rewrite its body to `return-void` (the rest of the first instruction
 /// nop-padded, `tries_size` zeroed). `ret_descriptor` must be `"V"` (void).
@@ -4011,6 +4113,73 @@ mod tests {
         assert_eq!(
             &full[16..24],
             &[0x14, 0x00, 0x78, 0x56, 0x34, 0x12, 0x0f, 0x00]
+        );
+    }
+
+    #[test]
+    fn method_const_string_emits_const_string_and_return_object() {
+        // Body large enough for const-string (2 units) + return-object (1 unit).
+        let mut code = code_item_with_nops(4);
+        assert!(rewrite_method_body_const_string(&mut code, 0, 0x0d9c).unwrap());
+        assert_eq!(
+            &code[16..22],
+            &[0x1a, 0x00, 0x9c, 0x0d, 0x11, 0x00],
+            "const-string v0, string@0d9c / return-object v0"
+        );
+        assert_eq!(&code[22..24], &[0x00, 0x00], "remainder nop-padded");
+    }
+
+    #[test]
+    fn method_const_string_preserves_tries_and_trailing_handlers() {
+        let mut code = code_item_with_nops(4);
+        code[6..8].copy_from_slice(&1u16.to_le_bytes());
+        let trailer = [0xAAu8; 12];
+        code.extend_from_slice(&trailer);
+
+        assert!(rewrite_method_body_const_string(&mut code, 0, 0x0001).unwrap());
+
+        assert_eq!(
+            u16::from_le_bytes([code[6], code[7]]),
+            1,
+            "tries_size preserved"
+        );
+        assert_eq!(&code[24..36], &trailer, "try/handler bytes preserved");
+    }
+
+    #[test]
+    fn method_const_string_refuses_body_without_room_or_registers() {
+        // One code unit cannot hold the 3-unit replacement.
+        let mut tiny = code_item_with_nops(1);
+        assert!(!rewrite_method_body_const_string(&mut tiny, 0, 1).unwrap());
+
+        // registers_size == 0 means v0 does not exist.
+        let mut no_regs = code_item_with_nops(4);
+        no_regs[0..2].copy_from_slice(&0u16.to_le_bytes());
+        assert!(!rewrite_method_body_const_string(&mut no_regs, 0, 1).unwrap());
+    }
+
+    #[test]
+    fn method_const_string_rejects_non_string_return() {
+        let mut dex = synthetic_public_redirect_dex();
+        let err = force_method_return_const_string(&mut dex, "Lx/Y;", "m", "I", &[], "CN")
+            .expect_err("non-string return must be rejected");
+        assert!(err.to_string().contains("Ljava/lang/String;"));
+    }
+
+    #[test]
+    fn method_const_string_refuses_absent_pool_string() {
+        // The string is not in this dex's pool, so no id may be created.
+        let mut dex = synthetic_public_redirect_dex();
+        assert!(
+            !force_method_return_const_string(
+                &mut dex,
+                "Lx/Y;",
+                "m",
+                "Ljava/lang/String;",
+                &[],
+                "a-string-that-is-not-in-the-pool",
+            )
+            .unwrap()
         );
     }
 
