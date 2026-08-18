@@ -33,6 +33,7 @@ system:/system/preinstall/minigameLauncher_release/
 system:/system/priv-app/LFHTianjiaoTablet/
 system:/system/priv-app/LeVoiceAgent/
 system:/system/priv-app/LenovoOTA/
+system:/system/priv-app/LenovoService/
 system:/system/priv-app/LenovoStore/
 system:/system/priv-app/LenovoWhatsNew/
 system:/system/priv-app/TabletPushOut/
