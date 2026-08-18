@@ -2436,7 +2436,7 @@ value = false
         }));
         let wu = load_dbp(&patches_dir().join("unlock-wifi.dbp")).expect("unlock-wifi.dbp");
         assert_eq!(wu.name, "unlock-wifi");
-        assert_eq!(wu.ops.len(), 2);
+        assert_eq!(wu.ops.len(), 3);
         match &wu.ops[0] {
             DbpOp::TextReplace {
                 partition,
@@ -2468,6 +2468,28 @@ value = false
                 assert_eq!(from.len(), to.len());
             }
             _ => panic!("unlock-wifi second op must neutralize Lenovo init country mapping"),
+        }
+        match &wu.ops[2] {
+            DbpOp::MethodCodePatch {
+                partition,
+                file,
+                class,
+                method,
+                proto,
+                replacements,
+                ..
+            } => {
+                assert_eq!(partition, "system");
+                assert_eq!(
+                    file,
+                    "system/priv-app/LeVoiceCaptionApp/LeVoiceCaptionApp.apk"
+                );
+                assert_eq!(class, "Lcom/zui/translator/utils/MicrosoftApiKey;");
+                assert_eq!(method, "getCountryCode");
+                assert_eq!(proto, "()Ljava/lang/String;");
+                assert_eq!(replacements.len(), 1);
+            }
+            _ => panic!("unlock-wifi third op must pin the translator country code"),
         }
         let le = load_dbp(&patches_dir().join("fix-leaudio.dbp")).expect("fix-leaudio.dbp");
         assert_eq!(le.name, "fix-leaudio");
@@ -4355,6 +4377,47 @@ value = false
                 );
             }
         }
+    }
+
+    /// Land the unlock-wifi translator country-code pin on the real
+    /// LeVoiceCaptionApp. Set `DYNOBOX_LEVOICECAPTION_APK`; optionally set
+    /// `DYNOBOX_LEVOICECAPTION_DEX_OUT` to dump the patched dex for
+    /// disassembly.
+    #[test]
+    fn unlock_wifi_country_code_op_lands_on_real_levoice_apk() {
+        let Ok(path) = std::env::var("DYNOBOX_LEVOICECAPTION_APK") else {
+            return;
+        };
+        let doc = load_dbp(&patches_dir().join("unlock-wifi.dbp")).unwrap();
+        let op = doc
+            .ops
+            .iter()
+            .find(|op| matches!(op, DbpOp::MethodCodePatch { .. }))
+            .expect("unlock-wifi must carry the translator country-code op");
+        let apk = std::fs::read(&path).expect("read apk");
+        let zip = crate::fuck_lgsi::parse_zip_central_directory(&apk).expect("zip");
+        let mut hits = 0usize;
+        for entry in zip.entries.iter().filter(|e| {
+            e.name.ends_with(".dex")
+                && e.compression_method == 0
+                && !e.uses_data_descriptor
+                && !e.is_zip64
+                && e.data_start + e.compressed_size <= apk.len()
+        }) {
+            let original = &apk[entry.data_start..entry.data_start + entry.compressed_size];
+            let mut dex = original.to_vec();
+            if apply_one_op(&mut dex, op).unwrap() {
+                hits += 1;
+                assert_eq!(dex.len(), original.len(), "patch must preserve dex length");
+                if let Ok(out_dir) = std::env::var("DYNOBOX_LEVOICECAPTION_DEX_OUT") {
+                    crate::fuck_lgsi::recompute_dex_header_sums(&mut dex);
+                    std::fs::create_dir_all(&out_dir).expect("create dex out dir");
+                    std::fs::write(std::path::Path::new(&out_dir).join(&entry.name), &dex)
+                        .expect("write patched dex");
+                }
+            }
+        }
+        assert_eq!(hits, 1, "country-code pin must land in exactly one dex");
     }
 
     /// Land the three new debloat-security ops (app-recommendation hide +
