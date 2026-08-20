@@ -2097,6 +2097,40 @@ pub fn force_invoke_const_bool(
         ret_descriptor,
         params,
         i32::from(value),
+        None,
+    )
+}
+
+/// Force only the zero-based `site_index` matching boolean invoke within the
+/// selected class/method scope. This keeps unrelated calls to the same region
+/// getter in one method untouched.
+#[allow(clippy::too_many_arguments)]
+pub fn force_invoke_const_bool_at(
+    dex: &mut [u8],
+    scan_class: &str,
+    scan_method: Option<&str>,
+    target_class: &str,
+    target_method: &str,
+    ret_descriptor: &str,
+    params: &[&str],
+    value: bool,
+    site_index: usize,
+) -> Result<usize> {
+    if ret_descriptor != "Z" {
+        return Err(anyhow!(
+            "force_invoke_const_bool_at requires a boolean (Z) getter, got `{ret_descriptor}`"
+        ));
+    }
+    force_invoke_const_scoped(
+        dex,
+        scan_class,
+        scan_method,
+        target_class,
+        target_method,
+        ret_descriptor,
+        params,
+        i32::from(value),
+        Some(site_index),
     )
 }
 
@@ -2129,6 +2163,7 @@ pub fn force_invoke_const_int(
         ret_descriptor,
         params,
         value,
+        None,
     )
 }
 
@@ -2145,6 +2180,7 @@ fn force_invoke_const_scoped(
     ret_descriptor: &str,
     params: &[&str],
     value: i32,
+    site_index: Option<usize>,
 ) -> Result<usize> {
     let Some(h) = read_dex_header(dex) else {
         return Ok(0);
@@ -2172,6 +2208,7 @@ fn force_invoke_const_scoped(
     };
 
     let mut sites = 0usize;
+    let mut seen_sites = 0usize;
     for (method_idx, code_off) in collect_method_code_offs(dex, class_data_off, h.method_ids_size)?
     {
         if let Some(want) = scan_method {
@@ -2179,7 +2216,14 @@ fn force_invoke_const_scoped(
                 continue;
             }
         }
-        sites += rewrite_invoke_sites(dex, code_off, target_method_idx, value)?;
+        sites += rewrite_invoke_sites_filtered(
+            dex,
+            code_off,
+            target_method_idx,
+            value,
+            site_index,
+            &mut seen_sites,
+        )?;
     }
     Ok(sites)
 }
@@ -2189,11 +2233,31 @@ fn force_invoke_const_scoped(
 /// followed by `move-result vAA` (opcode 0x0A) into a const load of `value`
 /// into vAA (`const/16` for i16-range values, else `const`), nop-padded to the
 /// original 4 units. Same-size, in place.
+#[cfg(test)]
 fn rewrite_invoke_sites(
     dex: &mut [u8],
     code_off: usize,
     target_method_idx: u32,
     value: i32,
+) -> Result<usize> {
+    let mut seen_sites = 0usize;
+    rewrite_invoke_sites_filtered(
+        dex,
+        code_off,
+        target_method_idx,
+        value,
+        None,
+        &mut seen_sites,
+    )
+}
+
+fn rewrite_invoke_sites_filtered(
+    dex: &mut [u8],
+    code_off: usize,
+    target_method_idx: u32,
+    value: i32,
+    site_index: Option<usize>,
+    seen_sites: &mut usize,
 ) -> Result<usize> {
     if code_off + 16 > dex.len() {
         return Ok(0);
@@ -2224,6 +2288,12 @@ fn rewrite_invoke_sites(
         if (0x6e..=0x72).contains(&opcode) && pc + 8 <= insns_end {
             let method_idx = u32::from(read_u16_le(dex, pc + 2));
             if method_idx == target_method_idx && dex[pc + 6] == 0x0A {
+                let rewrite = site_index.is_none_or(|index| *seen_sites == index);
+                *seen_sites += 1;
+                if !rewrite {
+                    pc += 8;
+                    continue;
+                }
                 let aa = dex[pc + 7];
                 // Overwrite the 4-unit `invoke-* … / move-result vAA` with a
                 // same-size const load of `value` into vAA, nop-padded.
@@ -4403,6 +4473,30 @@ mod tests {
         virt[23] = 0x05;
         assert_eq!(rewrite_invoke_sites(&mut virt, 0, 9, 1).unwrap(), 1);
         assert_eq!(&virt[16..20], &[0x13, 0x05, 0x01, 0x00], "const/16 v5, #1");
+    }
+
+    #[test]
+    fn invoke_const_site_index_rewrites_only_selected_call() {
+        let mut code = code_item_with_nops(8);
+        for (offset, register) in [(16usize, 1u8), (24usize, 2u8)] {
+            code[offset] = 0x71;
+            code[offset + 2] = 0x09;
+            code[offset + 6] = 0x0A;
+            code[offset + 7] = register;
+        }
+        let original_first = code[16..24].to_vec();
+        let mut seen_sites = 0usize;
+
+        let sites =
+            rewrite_invoke_sites_filtered(&mut code, 0, 9, 0, Some(1), &mut seen_sites).unwrap();
+
+        assert_eq!(sites, 1);
+        assert_eq!(seen_sites, 2);
+        assert_eq!(&code[16..24], original_first.as_slice());
+        assert_eq!(
+            &code[24..32],
+            &[0x13, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]

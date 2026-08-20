@@ -44,10 +44,10 @@ use serde::Deserialize;
 use crate::dex_patch::{
     DexMethodRef, DexPoolSymbol, DexPoolSymbolKind, MethodCodeReplacement, MethodCodeTemplateSlot,
     NopAnchor, force_field_const_bool, force_fragment_render_gone, force_invoke_const_bool,
-    force_invoke_const_int, force_method_broadcast_finish, force_method_return_bool,
-    force_method_return_const_string, force_method_return_int, force_method_return_void,
-    force_nop_anchored_invoke, force_preference_controller_hidden, force_remoteviews_gone,
-    force_view_gone, parse_method_descriptor, patch_method_code,
+    force_invoke_const_bool_at, force_invoke_const_int, force_method_broadcast_finish,
+    force_method_return_bool, force_method_return_const_string, force_method_return_int,
+    force_method_return_void, force_nop_anchored_invoke, force_preference_controller_hidden,
+    force_remoteviews_gone, force_view_gone, parse_method_descriptor, patch_method_code,
     redirect_intent_action_to_broadcast, redirect_method_code, resolve_dex_pool_symbol,
     validate_method_code_template_slots,
 };
@@ -273,7 +273,7 @@ pub enum DbpOp {
         all: bool,
     },
     /// Force `invoke-static target_class.target_method()Z` results to `value`
-    /// at every call site inside `scan_class` (optionally one `scan_method`).
+    /// inside `scan_class` (optionally one `scan_method` and zero-based site).
     InvokeConstBool {
         partition: String,
         file: String,
@@ -284,6 +284,8 @@ pub enum DbpOp {
         target_method: String,
         #[serde(default = "default_bool_proto")]
         proto: String,
+        #[serde(default)]
+        site_index: Option<usize>,
         value: bool,
     },
     /// Like [`DbpOp::InvokeConstBool`] but for an int-returning (`I`) method:
@@ -1556,22 +1558,37 @@ fn apply_one_op(dex: &mut [u8], op: &DbpOp) -> Result<bool> {
             target_class,
             target_method,
             proto,
+            site_index,
             value,
             ..
         } => {
             let (ret, params) = parse_method_descriptor(proto)
                 .ok_or_else(|| anyhow!("invalid descriptor `{proto}`"))?;
             let param_refs: Vec<&str> = params.iter().map(String::as_str).collect();
-            let sites = force_invoke_const_bool(
-                dex,
-                scan_class,
-                scan_method.as_deref(),
-                target_class,
-                target_method,
-                &ret,
-                &param_refs,
-                *value,
-            )?;
+            let sites = if let Some(site_index) = site_index {
+                force_invoke_const_bool_at(
+                    dex,
+                    scan_class,
+                    scan_method.as_deref(),
+                    target_class,
+                    target_method,
+                    &ret,
+                    &param_refs,
+                    *value,
+                    *site_index,
+                )?
+            } else {
+                force_invoke_const_bool(
+                    dex,
+                    scan_class,
+                    scan_method.as_deref(),
+                    target_class,
+                    target_method,
+                    &ret,
+                    &param_refs,
+                    *value,
+                )?
+            };
             Ok(sites > 0)
         }
         DbpOp::InvokeConstInt {
@@ -2452,7 +2469,25 @@ value = false
         let cl =
             load_dbp(&patches_dir().join("debloat-launcher.dbp")).expect("debloat-launcher.dbp");
         assert_eq!(cl.name, "debloat-launcher");
-        assert_eq!(cl.ops.len(), 3);
+        assert_eq!(cl.ops.len(), 6);
+        assert!(cl.ops.iter().any(|op| {
+            matches!(
+                op,
+                DbpOp::InvokeConstBool {
+                    scan_class,
+                    scan_method,
+                    target_class,
+                    target_method,
+                    site_index: Some(1),
+                    value,
+                    ..
+                } if scan_class == "Lcom/android/launcher3/icons/BaseIconFactory;"
+                    && scan_method.as_deref() == Some("createBadgedIconBitmapZui")
+                    && target_class == "Lcom/android/launcher3/icons/GraphicsUtils;"
+                    && target_method == "isZuiRow"
+                    && !value
+            )
+        }));
         let zs = load_dbp(&patches_dir().join("unlock-locales.dbp")).expect("unlock-locales.dbp");
         assert_eq!(zs.name, "unlock-locales");
         assert_eq!(zs.ops.len(), 14);
@@ -4719,6 +4754,9 @@ value = false
         let doc = load_dbp(&patches_dir().join("debloat-launcher.dbp")).unwrap();
         let dir = std::path::Path::new(&dir);
         let mut landed = 0usize;
+        let mut regular_badge_sites = 0usize;
+        let mut zui_badge_sites = 0usize;
+        let mut row_clone_overlay_sites = 0usize;
         for name in ["classes.dex", "classes2.dex", "classes3.dex"] {
             let Ok(mut dex) = std::fs::read(dir.join(name)) else {
                 continue;
@@ -4728,8 +4766,50 @@ value = false
                     landed += 1;
                 }
             }
+            regular_badge_sites += force_invoke_const_bool(
+                &mut dex,
+                "Lcom/android/launcher3/icons/BaseIconFactory;",
+                Some("createBadgedIconBitmap"),
+                "Lcom/android/launcher3/icons/GraphicsUtils;",
+                "isZuiRow",
+                "Z",
+                &[],
+                false,
+            )
+            .unwrap();
+            zui_badge_sites += force_invoke_const_bool(
+                &mut dex,
+                "Lcom/android/launcher3/icons/BaseIconFactory;",
+                Some("createBadgedIconBitmapZui"),
+                "Lcom/android/launcher3/icons/GraphicsUtils;",
+                "isZuiRow",
+                "Z",
+                &[],
+                false,
+            )
+            .unwrap();
+            row_clone_overlay_sites += force_invoke_const_bool(
+                &mut dex,
+                "Lcom/android/launcher3/icons/BitmapInfo;",
+                Some("a"),
+                "Lcom/android/launcher3/icons/GraphicsUtils;",
+                "isZuiRow",
+                "Z",
+                &[],
+                false,
+            )
+            .unwrap();
         }
-        assert_eq!(landed, 3, "all three debloat-launcher ops should land");
+        assert_eq!(landed, 6, "all six debloat-launcher ops should land");
+        assert_eq!(regular_badge_sites, 0, "regular PRC badge gate is patched");
+        assert_eq!(
+            zui_badge_sites, 1,
+            "the unrelated first Zui icon-style gate remains ROW"
+        );
+        assert_eq!(
+            row_clone_overlay_sites, 0,
+            "ROW clone-chain overlay gate is patched"
+        );
     }
 
     /// Apply the bundled debloat-theme FontActivity op to a real HomeSettings APK.

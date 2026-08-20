@@ -1,6 +1,6 @@
 
 name = "debloat-launcher"
-description = "Use ROW launcher behavior."
+description = "Use ROW launcher behavior with PRC profile badges."
 
 [[op]]
 kind = "method_const_bool"
@@ -17,6 +17,37 @@ file = "system/priv-app/ZuiLauncher/ZuiLauncher.apk"
 class = "Lcom/android/launcher3/icons/GraphicsUtils;"
 method = "isZuiRow"
 value = true
+
+[[op]]
+kind = "invoke_const_bool"
+partition = "system"
+file = "system/priv-app/ZuiLauncher/ZuiLauncher.apk"
+scan_class = "Lcom/android/launcher3/icons/BaseIconFactory;"
+scan_method = "createBadgedIconBitmap"
+target_class = "Lcom/android/launcher3/icons/GraphicsUtils;"
+target_method = "isZuiRow"
+value = false
+
+[[op]]
+kind = "invoke_const_bool"
+partition = "system"
+file = "system/priv-app/ZuiLauncher/ZuiLauncher.apk"
+scan_class = "Lcom/android/launcher3/icons/BaseIconFactory;"
+scan_method = "createBadgedIconBitmapZui"
+target_class = "Lcom/android/launcher3/icons/GraphicsUtils;"
+target_method = "isZuiRow"
+site_index = 1
+value = false
+
+[[op]]
+kind = "invoke_const_bool"
+partition = "system"
+file = "system/priv-app/ZuiLauncher/ZuiLauncher.apk"
+scan_class = "Lcom/android/launcher3/icons/BitmapInfo;"
+scan_method = "a"
+target_class = "Lcom/android/launcher3/icons/GraphicsUtils;"
+target_method = "isZuiRow"
+value = false
 
 [[op]]
 kind = "method_const_bool"
