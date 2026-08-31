@@ -724,6 +724,13 @@ fn operation_progress_weight(op: &crate::payload::proto::InstallOperation, block
     data_length.saturating_add(dst_bytes / 32)
 }
 
+fn fec_extents(p_manifest: &crate::payload::proto::PartitionUpdate) -> Option<(&Extent, &Extent)> {
+    p_manifest
+        .fec_data_extent
+        .as_ref()
+        .zip(p_manifest.fec_extent.as_ref())
+}
+
 pub fn apply_partition_payload(
     payload_path: &Path,
     partition_name: &str,
@@ -872,9 +879,17 @@ pub fn apply_partition_payload_with_progress(
         .map(|(data_ext, _)| data_ext.num_blocks.unwrap_or(0))
         .unwrap_or(0);
     let verity_weight: u64 = verity_data_blocks.saturating_mul(block_size as u64);
+    // FEC generation reads every byte covered by fec_data_extent. Derive the
+    // weight from the same paired-extent helper as regenerate_fec so a manifest
+    // missing either extent contributes no weight and also skips generation.
+    let fec_weight = match fec_extents(p_manifest) {
+        Some((data_ext, _)) => Patcher::new(block_size).extent_byte_range(data_ext)?.1,
+        None => 0,
+    };
     let total_weight: u64 = pre_copy_len
         .saturating_add(op_weight_total)
-        .saturating_add(verity_weight);
+        .saturating_add(verity_weight)
+        .saturating_add(fec_weight);
     let mut done_weight: u64 = 0;
 
     if let Some(cb) = progress.as_deref_mut() {
@@ -980,7 +995,29 @@ pub fn apply_partition_payload_with_progress(
         };
         regenerate_verity_hash_tree(p_manifest, &mut dst_file, block_size, Some(&mut tick))?;
     }
-    regenerate_fec(p_manifest, new_image, &mut dst_file, block_size)?;
+    // FEC reads fec_weight bytes and performs RS encoding over them. Report at
+    // the same 16 MiB cadence as verity so the final apply phase stays visible.
+    {
+        const FEC_REPORT_EVERY: u64 = 16 * 1024 * 1024;
+        let mut bytes_since_last_report: u64 = 0;
+        let mut tick = |delta: u64| {
+            done_weight = done_weight.saturating_add(delta);
+            bytes_since_last_report = bytes_since_last_report.saturating_add(delta);
+            if let Some(cb) = progress.as_deref_mut() {
+                if bytes_since_last_report >= FEC_REPORT_EVERY {
+                    cb(done_weight, total_weight);
+                    bytes_since_last_report = 0;
+                }
+            }
+        };
+        regenerate_fec(
+            p_manifest,
+            new_image,
+            &mut dst_file,
+            block_size,
+            Some(&mut tick),
+        )?;
+    }
     if let Some(cb) = progress.as_mut() {
         cb(done_weight, total_weight);
     }
@@ -993,13 +1030,11 @@ fn regenerate_fec(
     image_path: &Path,
     dst_file: &mut File,
     block_size: u32,
+    mut progress: Option<&mut dyn FnMut(u64)>,
 ) -> Result<()> {
-    let (data_ext, fec_ext) = match (
-        p_manifest.fec_data_extent.as_ref(),
-        p_manifest.fec_extent.as_ref(),
-    ) {
-        (Some(data), Some(fec)) => (data, fec),
-        _ => return Ok(()),
+    let (data_ext, fec_ext) = match fec_extents(p_manifest) {
+        Some(extents) => extents,
+        None => return Ok(()),
     };
 
     let patcher = Patcher::new(block_size);
@@ -1016,14 +1051,69 @@ fn regenerate_fec(
     let fec_roots = p_manifest.fec_roots.unwrap_or(2);
 
     dst_file.flush()?;
-    let fec = avbtool_rs::fec::generate_fec_from_image(image_path, data_size, fec_roots)
-        .map_err(|error| DynoError::Tool(format!("FEC generation failed: {error}")))?;
-    if fec.len() as u64 != fec_size {
+    if data_size == 0 || !data_size.is_multiple_of(avbtool_rs::fec::FEC_BLOCKSIZE) {
         return Err(DynoError::Tool(format!(
-            "FEC size mismatch: generated {} bytes, manifest extent needs {fec_size} bytes",
-            fec.len()
+            "FEC generation failed: input size {data_size} must be a non-zero multiple of {} bytes",
+            avbtool_rs::fec::FEC_BLOCKSIZE
         )));
     }
+
+    let roots = usize::try_from(fec_roots)
+        .map_err(|_| DynoError::Tool("FEC roots exceed addressable memory".into()))?;
+    let encoder = avbtool_rs::fec::ReedSolomonEncoder::new_avb(roots)
+        .map_err(|error| DynoError::Tool(format!("FEC generation failed: {error}")))?;
+    let rsn = encoder.data_bytes_per_round();
+    let blocks = data_size / avbtool_rs::fec::FEC_BLOCKSIZE;
+    let rounds = blocks.div_ceil(rsn as u64);
+    let generated_size = avbtool_rs::fec::fec_size_for_input(data_size, fec_roots);
+    if generated_size != fec_size {
+        return Err(DynoError::Tool(format!(
+            "FEC size mismatch: generated {generated_size} bytes, manifest extent needs {fec_size} bytes"
+        )));
+    }
+
+    let generated_size_usize = usize::try_from(generated_size)
+        .map_err(|_| DynoError::Tool("Generated FEC exceeds addressable memory".into()))?;
+    let block_size_usize = avbtool_rs::fec::FEC_BLOCKSIZE as usize;
+    let mut image = File::open(image_path)
+        .map_err(|error| DynoError::Tool(format!("FEC generation failed: {error}")))?;
+    let mut fec = Vec::with_capacity(generated_size_usize);
+    let mut parity = vec![0u8; roots];
+    let mut round_data = vec![0u8; rsn];
+    let mut source_blocks = vec![0u8; rsn * block_size_usize];
+
+    // Match avbtool-rs's AOSP block interleaving exactly. A round gathers
+    // every `rounds`th source block; missing blocks in the final round remain
+    // zero, and each byte column becomes one RS codeword.
+    for round_idx in 0..rounds {
+        source_blocks.fill(0);
+        for j in 0..rsn {
+            let block_idx = round_idx + (j as u64) * rounds;
+            if block_idx < blocks {
+                image
+                    .seek(SeekFrom::Start(block_idx * avbtool_rs::fec::FEC_BLOCKSIZE))
+                    .map_err(|error| DynoError::Tool(format!("FEC generation failed: {error}")))?;
+                let dst = j * block_size_usize;
+                image
+                    .read_exact(&mut source_blocks[dst..dst + block_size_usize])
+                    .map_err(|error| DynoError::Tool(format!("FEC generation failed: {error}")))?;
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(avbtool_rs::fec::FEC_BLOCKSIZE);
+                }
+            }
+        }
+
+        for byte_in_block in 0..block_size_usize {
+            for j in 0..rsn {
+                round_data[j] = source_blocks[j * block_size_usize + byte_in_block];
+            }
+            encoder
+                .encode_round(&round_data, &mut parity)
+                .map_err(|error| DynoError::Tool(format!("FEC generation failed: {error}")))?;
+            fec.extend_from_slice(&parity);
+        }
+    }
+    fec.resize(generated_size_usize, 0);
 
     dst_file.seek(SeekFrom::Start(fec_offset))?;
     dst_file.write_all(&fec)?;
@@ -1186,11 +1276,14 @@ mod tests {
     use prost::Message;
 
     use super::{
-        MAX_REPLACE_DECOMPRESS_BYTES, Patcher, decompress_replace_to_exact_size, hash_data_blocks,
-        inspect_operation_support, pad_to_block_multiple, read_exactly_or_overflow, regenerate_fec,
+        MAX_REPLACE_DECOMPRESS_BYTES, Patcher, apply_partition_payload_with_progress,
+        decompress_replace_to_exact_size, hash_data_blocks, inspect_operation_support,
+        pad_to_block_multiple, read_exactly_or_overflow, regenerate_fec,
     };
     use crate::payload::proto::install_operation::Type;
-    use crate::payload::proto::{Extent, InstallOperation};
+    use crate::payload::proto::{
+        DeltaArchiveManifest, Extent, InstallOperation, PartitionInfo, PartitionUpdate,
+    };
     use crate::puffin::proto::{PatchHeader, StreamInfo, patch_header::PatchType};
 
     fn extent(start_block: u64, num_blocks: u64) -> Extent {
@@ -1235,10 +1328,133 @@ mod tests {
             .open(&image_path)
             .unwrap();
 
-        regenerate_fec(&partition, &image_path, &mut file, 4096).unwrap();
+        regenerate_fec(&partition, &image_path, &mut file, 4096, None).unwrap();
 
         let result = fs::read(&image_path).unwrap();
         assert_eq!(&result[4096..], expected_fec);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn streaming_fec_matches_reference_across_rounds_with_tail_padding() {
+        let dir = test_temp_dir("streaming-fec-identity");
+        let image_path = dir.join("vendor.img");
+        let roots = 2u32;
+        let encoder = avbtool_rs::fec::ReedSolomonEncoder::new_avb(roots as usize).unwrap();
+        // One block beyond a full RS interleave round forces a second round
+        // whose unused source-block slots are zero-padded.
+        let data_blocks = encoder.data_bytes_per_round() as u64 + 1;
+        let data_size = data_blocks * avbtool_rs::fec::FEC_BLOCKSIZE;
+        let mut image = vec![0u8; data_size as usize];
+        for (index, byte) in image.iter_mut().enumerate() {
+            *byte = ((index * 17 + 11) % 251) as u8;
+        }
+        image[0] = 0x42;
+        let fec_size = avbtool_rs::fec::fec_size_for_input(data_size, roots);
+        image.resize((data_size + fec_size) as usize, 0xa5);
+        fs::write(&image_path, image).unwrap();
+
+        let expected =
+            avbtool_rs::fec::generate_fec_from_image(&image_path, data_size, roots).unwrap();
+        let partition = PartitionUpdate {
+            fec_data_extent: Some(extent(0, data_blocks)),
+            fec_extent: Some(extent(
+                data_blocks,
+                fec_size / avbtool_rs::fec::FEC_BLOCKSIZE,
+            )),
+            fec_roots: Some(roots),
+            ..Default::default()
+        };
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image_path)
+            .unwrap();
+        let mut consumed = 0u64;
+        let mut tick = |delta| consumed += delta;
+
+        regenerate_fec(&partition, &image_path, &mut file, 4096, Some(&mut tick)).unwrap();
+
+        let result = fs::read(&image_path).unwrap();
+        assert_eq!(&result[data_size as usize..], expected);
+        assert_eq!(consumed, data_size);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partition_apply_progress_with_verity_and_fec_is_bounded_and_complete() {
+        let dir = test_temp_dir("verity-fec-progress");
+        let payload_path = dir.join("payload.bin");
+        let old_image = dir.join("missing-old.img");
+        let new_image = dir.join("new.img");
+        let block_size = 4096u32;
+        let operation_data: Vec<u8> = (0..block_size as usize)
+            .map(|index| ((index * 13 + 7) % 251) as u8)
+            .collect();
+        let operation = InstallOperation {
+            r#type: Type::Replace as i32,
+            data_offset: Some(0),
+            data_length: Some(operation_data.len() as u64),
+            dst_extents: vec![extent(0, 1)],
+            ..Default::default()
+        };
+        let partition = PartitionUpdate {
+            partition_name: "vendor".into(),
+            new_partition_info: Some(PartitionInfo {
+                size: Some(4 * block_size as u64),
+                ..Default::default()
+            }),
+            operations: vec![operation],
+            hash_tree_data_extent: Some(extent(0, 1)),
+            hash_tree_extent: Some(extent(1, 1)),
+            hash_tree_algorithm: Some("sha256".into()),
+            hash_tree_salt: Some(vec![0x5a; 32]),
+            fec_data_extent: Some(extent(0, 2)),
+            fec_extent: Some(extent(2, 2)),
+            fec_roots: Some(2),
+            ..Default::default()
+        };
+        let manifest = DeltaArchiveManifest {
+            block_size: Some(block_size),
+            partitions: vec![partition],
+            ..Default::default()
+        };
+        let manifest_bytes = manifest.encode_to_vec();
+        let mut payload = fs::File::create(&payload_path).unwrap();
+        payload.write_all(crate::payload::PAYLOAD_MAGIC).unwrap();
+        payload.write_all(&2u64.to_be_bytes()).unwrap();
+        payload
+            .write_all(&(manifest_bytes.len() as u64).to_be_bytes())
+            .unwrap();
+        payload.write_all(&0u32.to_be_bytes()).unwrap();
+        payload.write_all(&manifest_bytes).unwrap();
+        payload.write_all(&operation_data).unwrap();
+        payload.flush().unwrap();
+        drop(payload);
+
+        let mut events = Vec::new();
+        let mut callback = |done, total| events.push((done, total));
+        apply_partition_payload_with_progress(
+            &payload_path,
+            "vendor",
+            &old_image,
+            &new_image,
+            block_size,
+            Some(&mut callback),
+        )
+        .unwrap();
+
+        assert!(!events.is_empty());
+        assert!(events.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        assert!(events.iter().all(|(done, total)| done <= total));
+        assert!(events.iter().all(|(_, total)| *total == events[0].1));
+        let &(done, total) = events.last().unwrap();
+        let expected_total = operation_data.len() as u64
+            + block_size as u64 / 32
+            + block_size as u64
+            + 2 * block_size as u64;
+        assert_eq!(total, expected_total);
+        assert_eq!(done, total);
         fs::remove_dir_all(dir).unwrap();
     }
 
