@@ -980,10 +980,54 @@ pub fn apply_partition_payload_with_progress(
         };
         regenerate_verity_hash_tree(p_manifest, &mut dst_file, block_size, Some(&mut tick))?;
     }
+    regenerate_fec(p_manifest, new_image, &mut dst_file, block_size)?;
     if let Some(cb) = progress.as_mut() {
         cb(done_weight, total_weight);
     }
 
+    Ok(())
+}
+
+fn regenerate_fec(
+    p_manifest: &crate::payload::proto::PartitionUpdate,
+    image_path: &Path,
+    dst_file: &mut File,
+    block_size: u32,
+) -> Result<()> {
+    let (data_ext, fec_ext) = match (
+        p_manifest.fec_data_extent.as_ref(),
+        p_manifest.fec_extent.as_ref(),
+    ) {
+        (Some(data), Some(fec)) => (data, fec),
+        _ => return Ok(()),
+    };
+
+    let patcher = Patcher::new(block_size);
+    let file_len = dst_file.metadata()?.len();
+    patcher.validate_extents_within_file(std::slice::from_ref(data_ext), file_len, "FEC data")?;
+    patcher.validate_extents_within_file(std::slice::from_ref(fec_ext), file_len, "FEC output")?;
+    let (data_offset, data_size) = patcher.extent_byte_range(data_ext)?;
+    if data_offset != 0 {
+        return Err(DynoError::Tool(format!(
+            "FEC data extent must start at byte 0, found {data_offset}"
+        )));
+    }
+    let (fec_offset, fec_size) = patcher.extent_byte_range(fec_ext)?;
+    let fec_roots = p_manifest.fec_roots.unwrap_or(2);
+
+    dst_file.flush()?;
+    let fec = avbtool_rs::fec::generate_fec_from_image(image_path, data_size, fec_roots)
+        .map_err(|error| DynoError::Tool(format!("FEC generation failed: {error}")))?;
+    if fec.len() as u64 != fec_size {
+        return Err(DynoError::Tool(format!(
+            "FEC size mismatch: generated {} bytes, manifest extent needs {fec_size} bytes",
+            fec.len()
+        )));
+    }
+
+    dst_file.seek(SeekFrom::Start(fec_offset))?;
+    dst_file.write_all(&fec)?;
+    dst_file.flush()?;
     Ok(())
 }
 
@@ -1143,7 +1187,7 @@ mod tests {
 
     use super::{
         MAX_REPLACE_DECOMPRESS_BYTES, Patcher, decompress_replace_to_exact_size, hash_data_blocks,
-        inspect_operation_support, pad_to_block_multiple, read_exactly_or_overflow,
+        inspect_operation_support, pad_to_block_multiple, read_exactly_or_overflow, regenerate_fec,
     };
     use crate::payload::proto::install_operation::Type;
     use crate::payload::proto::{Extent, InstallOperation};
@@ -1167,6 +1211,35 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn regenerates_fec_after_updating_verity_tree() {
+        let dir = test_temp_dir("regenerate-fec");
+        let image_path = dir.join("vendor.img");
+        let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let expected_fec = avbtool_rs::fec::generate_fec_bytes(&data, 2).unwrap();
+        let mut image = data;
+        image.extend(vec![0xa5; expected_fec.len()]);
+        fs::write(&image_path, image).unwrap();
+
+        let partition = crate::payload::proto::PartitionUpdate {
+            fec_data_extent: Some(extent(0, 1)),
+            fec_extent: Some(extent(1, 2)),
+            fec_roots: Some(2),
+            ..Default::default()
+        };
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image_path)
+            .unwrap();
+
+        regenerate_fec(&partition, &image_path, &mut file, 4096).unwrap();
+
+        let result = fs::read(&image_path).unwrap();
+        assert_eq!(&result[4096..], expected_fec);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

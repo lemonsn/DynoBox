@@ -996,6 +996,7 @@ dependencies = [
 name = "dynobox-payload"
 version = "0.2.8"
 dependencies = [
+ "avbtool-rs",
  "bsdiff-android",
  "bytes",
  "bzip2",

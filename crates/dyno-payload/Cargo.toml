@@ -8,6 +8,7 @@ authors.workspace = true
 description = "OTA payload metadata and patch-planning crate for DynoBox"
 
 [dependencies]
+avbtool-rs.workspace = true
 dynobox-core.workspace = true
 prost = "0.14"
 bytes = "1.12"
