@@ -24,6 +24,7 @@
 //! stderr, doesn't ship Continue / Yes / No buttons, and doesn't
 //! render a log pane — the terminal owns all that.
 
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -33,14 +34,164 @@ use eframe::egui;
 use egui::{CentralPanel, ScrollArea};
 use egui_extras::DatePickerButton;
 use jiff::civil::Date;
+use serde::{Deserialize, Serialize};
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+const HISTORY_STORAGE_KEY: &str = "dynobox_run_history";
+const HISTORY_SCHEMA_VERSION: u32 = 1;
+const HISTORY_LIMIT: usize = 50;
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 enum Mode {
     #[default]
     Apply,
     Unpack,
     Resign,
     Repack,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FormSnapshot {
+    schema_version: u32,
+    mode: Mode,
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    integrity_key: Option<PathBuf>,
+    ota_zips: Vec<PathBuf>,
+    do_resign: bool,
+    do_repack: bool,
+    do_complete: bool,
+    key: String,
+    key_path: Option<PathBuf>,
+    force: bool,
+    rollback: String,
+    boot_spl: String,
+    vendor_spl: String,
+    system_spl: String,
+    fuck_lgsi: bool,
+    fuck_lgsi_config: Option<PathBuf>,
+    debloat: bool,
+    debloat_list: Option<PathBuf>,
+    plus_patches: Vec<PathBuf>,
+}
+
+impl FormSnapshot {
+    fn capture(gui: &DynoGui) -> Self {
+        Self {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            mode: gui.mode,
+            input: gui.input.clone(),
+            output: gui.output.clone(),
+            integrity_key: gui.integrity_key.clone(),
+            ota_zips: gui.ota_zips.clone(),
+            do_resign: gui.do_resign,
+            do_repack: gui.do_repack,
+            do_complete: gui.do_complete,
+            key: gui.key.clone(),
+            key_path: gui.key_path.clone(),
+            force: gui.force,
+            rollback: gui.rollback.clone(),
+            boot_spl: gui.boot_spl.clone(),
+            vendor_spl: gui.vendor_spl.clone(),
+            system_spl: gui.system_spl.clone(),
+            fuck_lgsi: gui.fuck_lgsi,
+            fuck_lgsi_config: gui.fuck_lgsi_config.clone(),
+            debloat: gui.debloat,
+            debloat_list: gui.debloat_list.clone(),
+            plus_patches: gui.plus_patches.clone(),
+        }
+    }
+
+    fn restore_form(&self, gui: &mut DynoGui) {
+        gui.mode = self.mode;
+        gui.input.clone_from(&self.input);
+        gui.output.clone_from(&self.output);
+        gui.integrity_key.clone_from(&self.integrity_key);
+        gui.ota_zips.clone_from(&self.ota_zips);
+        gui.do_resign = self.do_resign;
+        gui.do_repack = self.do_repack;
+        gui.do_complete = self.do_complete;
+        gui.key.clone_from(&self.key);
+        gui.key_path.clone_from(&self.key_path);
+        gui.force = self.force;
+        gui.rollback.clone_from(&self.rollback);
+        gui.boot_spl.clone_from(&self.boot_spl);
+        gui.vendor_spl.clone_from(&self.vendor_spl);
+        gui.system_spl.clone_from(&self.system_spl);
+        gui.boot_spl_date = restored_spl_date(&self.boot_spl);
+        gui.vendor_spl_date = restored_spl_date(&self.vendor_spl);
+        gui.system_spl_date = restored_spl_date(&self.system_spl);
+        gui.fuck_lgsi = self.fuck_lgsi;
+        gui.fuck_lgsi_config.clone_from(&self.fuck_lgsi_config);
+        gui.debloat = self.debloat;
+        gui.debloat_list.clone_from(&self.debloat_list);
+        gui.plus_patches.clone_from(&self.plus_patches);
+    }
+
+    fn command_line(&self) -> String {
+        let mut gui = DynoGui::default();
+        self.restore_form(&mut gui);
+        gui.build_args().join(" ")
+    }
+}
+
+#[derive(Default)]
+struct RunHistory {
+    entries: Vec<FormSnapshot>,
+}
+
+impl RunHistory {
+    fn from_json(payload: &str) -> Self {
+        let Ok(mut entries) = serde_json::from_str::<Vec<FormSnapshot>>(payload) else {
+            return Self::default();
+        };
+        entries.retain(|entry| entry.schema_version == HISTORY_SCHEMA_VERSION);
+        entries.truncate(HISTORY_LIMIT);
+        Self { entries }
+    }
+
+    fn to_json(&self) -> Option<String> {
+        serde_json::to_string(&self.entries).ok()
+    }
+
+    fn insert(&mut self, snapshot: FormSnapshot) {
+        if let Some(index) = self.entries.iter().position(|entry| entry == &snapshot) {
+            self.entries.remove(index);
+        }
+        self.entries.insert(0, snapshot);
+        self.entries.truncate(HISTORY_LIMIT);
+    }
+
+    fn delete(&mut self, index: usize) {
+        if index < self.entries.len() {
+            self.entries.remove(index);
+        }
+    }
+}
+
+#[derive(Default)]
+struct MissingPaths {
+    paths: HashSet<PathBuf>,
+}
+
+impl MissingPaths {
+    fn classify(snapshot: &FormSnapshot) -> Self {
+        let mut paths = HashSet::new();
+        let candidates = snapshot
+            .input
+            .iter()
+            .chain(snapshot.integrity_key.iter())
+            .chain(snapshot.ota_zips.iter())
+            .chain(snapshot.key_path.iter())
+            .chain(snapshot.fuck_lgsi_config.iter())
+            .chain(snapshot.debloat_list.iter())
+            .chain(snapshot.plus_patches.iter());
+        paths.extend(candidates.filter(|path| !path.exists()).cloned());
+        Self { paths }
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.paths.contains(path)
+    }
 }
 
 impl Mode {
@@ -87,6 +238,10 @@ struct DynoGui {
     // Last spawn result, surfaced inline next to the Run button so
     // the user knows whether the terminal launched OK.
     last_status: Option<Result<String, String>>,
+
+    history: RunHistory,
+    history_open: bool,
+    missing_paths: MissingPaths,
 }
 
 impl Default for DynoGui {
@@ -124,6 +279,9 @@ impl Default for DynoGui {
             debloat_list: None,
             plus_patches: Vec::new(),
             last_status: None,
+            history: RunHistory::default(),
+            history_open: false,
+            missing_paths: MissingPaths::default(),
         }
     }
 }
@@ -284,10 +442,17 @@ impl DynoGui {
         }
         let exe = Self::locate_dynobox_exe();
         let args = self.build_args();
-        self.last_status = Some(match spawn_in_terminal(&exe, &args) {
-            Ok(()) => Ok(format!("Launched: {} {}", exe.display(), args.join(" "))),
-            Err(e) => Err(format!("Spawn failed: {e}")),
-        });
+        match spawn_in_terminal(&exe, &args) {
+            Ok(()) => {
+                self.history.insert(FormSnapshot::capture(self));
+                self.last_status = Some(Ok(format!(
+                    "Launched: {} {}",
+                    exe.display(),
+                    args.join(" ")
+                )));
+            }
+            Err(e) => self.last_status = Some(Err(format!("Spawn failed: {e}"))),
+        }
     }
 
     /// Return `Err(msg)` when the current control state would
@@ -325,6 +490,14 @@ impl eframe::App for DynoGui {
                                 egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                                     .weak()
                                     .size(14.0),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::BOTTOM),
+                                |ui| {
+                                    if ui.button("🕘").on_hover_text("Run history").clicked() {
+                                        self.history_open = true;
+                                    }
+                                },
                             );
                         },
                     );
@@ -379,10 +552,84 @@ impl eframe::App for DynoGui {
                     self.run_button(ui);
                 });
         });
+        self.history_window(ui.ctx());
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Some(payload) = self.history.to_json() {
+            storage.set_string(HISTORY_STORAGE_KEY, payload);
+        }
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
     }
 }
 
 impl DynoGui {
+    fn from_storage(storage: Option<&dyn eframe::Storage>) -> Self {
+        let mut gui = Self::default();
+        if let Some(payload) = storage.and_then(|storage| storage.get_string(HISTORY_STORAGE_KEY)) {
+            gui.history = RunHistory::from_json(&payload);
+        }
+        gui
+    }
+
+    fn load_history_entry(&mut self, snapshot: &FormSnapshot) {
+        self.missing_paths = MissingPaths::classify(snapshot);
+        snapshot.restore_form(self);
+        self.last_status = None;
+        self.history_open = false;
+    }
+
+    fn history_window(&mut self, ctx: &egui::Context) {
+        if !self.history_open {
+            return;
+        }
+        let mut open = self.history_open;
+        let mut load = None;
+        let mut delete = None;
+        egui::Window::new("Run history")
+            .open(&mut open)
+            .default_size([480.0, 400.0])
+            .show(ctx, |ui| {
+                if self.history.entries.is_empty() {
+                    ui.label(egui::RichText::new("No previous runs").weak());
+                    return;
+                }
+                ScrollArea::vertical().show(ui, |ui| {
+                    for (index, entry) in self.history.entries.iter().enumerate() {
+                        ui.horizontal_top(|ui| {
+                            let command = entry.command_line();
+                            let command_width = (ui.available_width() - 32.0).max(120.0);
+                            if ui
+                                .add_sized(
+                                    [command_width, 0.0],
+                                    egui::Button::new(
+                                        egui::RichText::new(command).monospace().small(),
+                                    )
+                                    .wrap(),
+                                )
+                                .on_hover_text("Load these options")
+                                .clicked()
+                            {
+                                load = Some(entry.clone());
+                            }
+                            if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                                delete = Some(index);
+                            }
+                        });
+                    }
+                });
+            });
+        self.history_open = open;
+        if let Some(index) = delete {
+            self.history.delete(index);
+        } else if let Some(snapshot) = load {
+            self.load_history_entry(&snapshot);
+        }
+    }
+
     fn io_picker(&mut self, ui: &mut egui::Ui, label: &str, is_input: bool) {
         ui.horizontal(|ui| {
             ui.label(format!("{label}:"));
@@ -400,7 +647,16 @@ impl DynoGui {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "—".to_string());
-            drag_scroll_path(ui, &text, if is_input { "io-input" } else { "io-output" });
+            let missing = is_input
+                && current
+                    .as_deref()
+                    .is_some_and(|path| self.missing_paths.contains(path));
+            drag_scroll_path(
+                ui,
+                &text,
+                if is_input { "io-input" } else { "io-output" },
+                missing,
+            );
         });
     }
 
@@ -423,6 +679,7 @@ impl DynoGui {
                 ui,
                 &path.display().to_string(),
                 "integrity-signing-key-path",
+                self.missing_paths.contains(path),
             );
         } else {
             ui.label(
@@ -461,7 +718,12 @@ impl DynoGui {
                     })
                     .response
                     .on_hover_text("Drag to reorder");
-                    drag_scroll_path(ui, &z.display().to_string(), &format!("ota-zip-{i}"));
+                    drag_scroll_path(
+                        ui,
+                        &z.display().to_string(),
+                        &format!("ota-zip-{i}"),
+                        self.missing_paths.contains(z),
+                    );
                 });
             });
             if let Some(payload) = dropped {
@@ -511,7 +773,12 @@ impl DynoGui {
                     if ui.small_button("✖").clicked() {
                         clear_key = true;
                     }
-                    drag_scroll_path(ui, &p.display().to_string(), "key-path");
+                    drag_scroll_path(
+                        ui,
+                        &p.display().to_string(),
+                        "key-path",
+                        self.missing_paths.contains(p),
+                    );
                 }
                 if clear_key {
                     self.key_path = None;
@@ -563,7 +830,11 @@ impl DynoGui {
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(interactive — Enter in terminal)".to_string());
-                    drag_scroll_path(ui, &text, "fuck-lgsi-config");
+                    let missing = self
+                        .fuck_lgsi_config
+                        .as_deref()
+                        .is_some_and(|path| self.missing_paths.contains(path));
+                    drag_scroll_path(ui, &text, "fuck-lgsi-config", missing);
                 });
             });
 
@@ -585,7 +856,11 @@ impl DynoGui {
                         .unwrap_or_else(|| {
                             "(interactive — edit debloat.txt in terminal)".to_string()
                         });
-                    drag_scroll_path(ui, &text, "debloat-list");
+                    let missing = self
+                        .debloat_list
+                        .as_deref()
+                        .is_some_and(|path| self.missing_paths.contains(path));
+                    drag_scroll_path(ui, &text, "debloat-list", missing);
                 });
             });
 
@@ -613,7 +888,12 @@ impl DynoGui {
             });
             for (i, p) in self.plus_patches.iter().enumerate() {
                 let text = p.display().to_string();
-                drag_scroll_path(ui, &text, &format!("plus-dbp-{i}"));
+                drag_scroll_path(
+                    ui,
+                    &text,
+                    &format!("plus-dbp-{i}"),
+                    self.missing_paths.contains(p),
+                );
             }
         });
     }
@@ -642,7 +922,7 @@ impl DynoGui {
 /// width. Replaces `Label::truncate()` for path display so a long
 /// `D:\Git\…\input.zip` no longer hides the filename behind an
 /// ellipsis. Hover surfaces the full string as a tooltip too.
-fn drag_scroll_path(ui: &mut egui::Ui, text: &str, id_salt: &str) {
+fn drag_scroll_path(ui: &mut egui::Ui, text: &str, id_salt: &str, missing: bool) {
     let row_h = ui.text_style_height(&egui::TextStyle::Body);
     egui::ScrollArea::horizontal()
         .id_salt(id_salt)
@@ -650,8 +930,12 @@ fn drag_scroll_path(ui: &mut egui::Ui, text: &str, id_salt: &str) {
         .auto_shrink([false, true])
         .scroll_source(egui::scroll_area::ScrollSource::ALL)
         .show(ui, |ui| {
+            let mut rich_text = egui::RichText::new(text).monospace();
+            if missing {
+                rich_text = rich_text.color(egui::Color32::LIGHT_RED);
+            }
             ui.add(
-                egui::Label::new(egui::RichText::new(text).monospace())
+                egui::Label::new(rich_text)
                     .wrap_mode(egui::TextWrapMode::Extend)
                     .selectable(true),
             )
@@ -702,6 +986,10 @@ fn parse_spl_date(s: &str) -> Result<Date, ()> {
         return Err(());
     }
     Date::new(y, m, d).map_err(|_| ())
+}
+
+fn restored_spl_date(value: &str) -> Date {
+    parse_spl_date(value.trim()).unwrap_or(Date::constant(2026, 1, 1))
 }
 
 /// Spawn `exe args…` inside a brand-new OS terminal window so the
@@ -984,9 +1272,10 @@ fn run_gui() -> eframe::Result {
         "DynoBox",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([520.0, 720.0]),
+            persist_window: false,
             ..Default::default()
         },
-        Box::new(|_cc| Ok(Box::new(DynoGui::default()))),
+        Box::new(|cc| Ok(Box::new(DynoGui::from_storage(cc.storage)))),
     )
 }
 
@@ -1020,6 +1309,32 @@ fn hide_owned_console() {
 mod tests {
     use super::*;
 
+    fn populated_gui(mode: Mode) -> DynoGui {
+        DynoGui {
+            mode,
+            input: Some(PathBuf::from("input-dir")),
+            output: Some(PathBuf::from("output-dir")),
+            integrity_key: Some(PathBuf::from("integrity.pem")),
+            ota_zips: vec![PathBuf::from("one.zip"), PathBuf::from("two.zip")],
+            do_resign: true,
+            do_repack: false,
+            do_complete: false,
+            key: "named-key".into(),
+            key_path: Some(PathBuf::from("custom-key.pem")),
+            force: true,
+            rollback: "1720000000".into(),
+            boot_spl: "2024-01-02".into(),
+            vendor_spl: "2024-03-04".into(),
+            system_spl: "2024-05-06".into(),
+            fuck_lgsi: true,
+            fuck_lgsi_config: Some(PathBuf::from("lgsi.json")),
+            debloat: true,
+            debloat_list: Some(PathBuf::from("debloat.txt")),
+            plus_patches: vec![PathBuf::from("one.dbp"), PathBuf::from("two.dbp")],
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn repack_args_include_optional_manifest_signing_key() {
         let gui = DynoGui {
@@ -1042,5 +1357,101 @@ mod tests {
                 "integrity.pem",
             ]
         );
+    }
+
+    #[test]
+    fn snapshots_restore_every_field_in_all_modes_and_rebuild_spl_dates() {
+        for mode in [Mode::Apply, Mode::Unpack, Mode::Resign, Mode::Repack] {
+            let original = populated_gui(mode);
+            let snapshot = FormSnapshot::capture(&original);
+            let mut restored = DynoGui::default();
+
+            snapshot.restore_form(&mut restored);
+
+            assert_eq!(snapshot.command_line(), original.build_args().join(" "));
+            assert_eq!(FormSnapshot::capture(&restored), snapshot);
+            assert_eq!(restored.boot_spl_date, Date::constant(2024, 1, 2));
+            assert_eq!(restored.vendor_spl_date, Date::constant(2024, 3, 4));
+            assert_eq!(restored.system_spl_date, Date::constant(2024, 5, 6));
+        }
+    }
+
+    #[test]
+    fn history_inserts_newest_deduplicates_caps_and_deletes() {
+        let mut history = RunHistory::default();
+        for index in 0..55 {
+            let mut gui = populated_gui(Mode::Apply);
+            gui.key = format!("key-{index}");
+            history.insert(FormSnapshot::capture(&gui));
+        }
+
+        assert_eq!(history.entries.len(), HISTORY_LIMIT);
+        assert_eq!(history.entries[0].key, "key-54");
+        assert_eq!(history.entries[HISTORY_LIMIT - 1].key, "key-5");
+
+        let duplicate = history.entries[10].clone();
+        history.insert(duplicate.clone());
+        assert_eq!(history.entries.len(), HISTORY_LIMIT);
+        assert_eq!(history.entries[0], duplicate);
+
+        let second = history.entries[1].clone();
+        history.delete(0);
+        assert_eq!(history.entries.len(), HISTORY_LIMIT - 1);
+        assert_eq!(history.entries[0], second);
+    }
+
+    #[test]
+    fn missing_path_classification_covers_inputs_and_excludes_output() {
+        let unique = format!(
+            "dynobox-gui-history-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&base).expect("create test directory");
+        let existing = base.join("existing.zip");
+        std::fs::write(&existing, b"zip").expect("create existing test path");
+
+        let mut gui = populated_gui(Mode::Apply);
+        gui.input = Some(base.join("missing-input"));
+        gui.output = Some(base.join("missing-output"));
+        gui.integrity_key = Some(base.join("missing-integrity.pem"));
+        gui.ota_zips = vec![base.join("missing.zip"), existing.clone()];
+        gui.key_path = Some(base.join("missing-key.pem"));
+        gui.fuck_lgsi_config = Some(base.join("missing-lgsi.json"));
+        gui.debloat_list = Some(base.join("missing-debloat.txt"));
+        gui.plus_patches = vec![base.join("missing.dbp")];
+        let snapshot = FormSnapshot::capture(&gui);
+
+        let missing = MissingPaths::classify(&snapshot);
+
+        for path in [
+            snapshot.input.as_deref(),
+            snapshot.integrity_key.as_deref(),
+            snapshot.ota_zips.first().map(PathBuf::as_path),
+            snapshot.key_path.as_deref(),
+            snapshot.fuck_lgsi_config.as_deref(),
+            snapshot.debloat_list.as_deref(),
+            snapshot.plus_patches.first().map(PathBuf::as_path),
+        ] {
+            assert!(missing.contains(path.expect("test path should be set")));
+        }
+        assert!(!missing.contains(&existing));
+        assert!(!missing.contains(snapshot.output.as_deref().expect("output should be set")));
+
+        std::fs::remove_dir_all(base).expect("remove test directory");
+    }
+
+    #[test]
+    fn malformed_or_wrong_version_history_degrades_to_empty() {
+        assert!(RunHistory::from_json("not-json").entries.is_empty());
+
+        let mut snapshot = FormSnapshot::capture(&populated_gui(Mode::Apply));
+        snapshot.schema_version = HISTORY_SCHEMA_VERSION + 1;
+        let payload = serde_json::to_string(&vec![snapshot]).expect("serialize test history");
+        assert!(RunHistory::from_json(&payload).entries.is_empty());
     }
 }
