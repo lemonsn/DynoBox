@@ -10,6 +10,8 @@ DynoBox is a cross-platform toolkit for unpacking, modifying, re-signing, and
 repacking Android firmware and OTA packages. It provides both a desktop GUI and
 a command-line interface.
 
+DynoBox currently supports only some models with Qualcomm chipsets.
+
 ## ⚠️ Disclaimer
 
 **For educational and development purposes only.** Modifying firmware can brick
@@ -21,11 +23,9 @@ responsible for how you use this software.
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
-![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white)
-![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
-![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black) ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)
 
 Download and extract the archive for your platform from
 **[GitHub Releases][releases]**.
@@ -35,7 +35,7 @@ Download and extract the archive for your platform from
 
 ---
 
-## What Can It Do?
+## 📋 What Can It Do?
 
 | Feature | What it does |
 |---|---|
@@ -50,7 +50,7 @@ required.
 
 ---
 
-## Usage
+## 🛠️ Usage
 
 The GUI exposes the common pipeline options and can launch the same operation
 in a terminal. For full control, use the CLI directly.
@@ -104,7 +104,13 @@ manifest, signature, or artifact inventory is malformed or tampered with.
 
 ---
 
-## License
+## 🙏 Credits
+
+- **[limzei89](https://note.com/limzei89/n/n3959e57a5021)**
+
+---
+
+## 📄 License
 
 DynoBox is licensed under the [Apache License 2.0][license].
 
